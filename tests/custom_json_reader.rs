@@ -8,8 +8,8 @@
 //! it is not intended to be used in production code.
 
 use crate::custom_reader::JsonValueReader;
+use futures::AsyncReadExt;
 use serde_json::json;
-use std::io::Read;
 use struson::{
     reader::{
         json_path::{json_path, JsonPath},
@@ -19,6 +19,7 @@ use struson::{
 };
 
 mod custom_reader {
+    use futures::{AsyncRead, FutureExt};
     use serde_json::Value;
     use std::{io::Read, iter::Peekable};
     use struson::{
@@ -72,8 +73,8 @@ mod custom_reader {
             self.current_position(true)
         }
 
-        fn begin_value(&mut self, expected: ValueType) -> Result<(), ReaderError> {
-            let actual = self.peek()?;
+        async fn begin_value(&mut self, expected: ValueType) -> Result<(), ReaderError> {
+            let actual = self.peek().await?;
             if actual == expected {
                 Ok(())
             } else {
@@ -97,7 +98,7 @@ mod custom_reader {
     }
 
     impl JsonReader for JsonValueReader<'_> {
-        fn peek(&mut self) -> Result<ValueType, ReaderError> {
+        async fn peek(&mut self) -> Result<ValueType, ReaderError> {
             self.verify_string_reader_inactive();
             if self.next_value.is_none() && self.stack.is_empty() {
                 panic!("Incorrect reader usage: Value has been consumed already")
@@ -135,8 +136,8 @@ mod custom_reader {
             })
         }
 
-        fn begin_object(&mut self) -> Result<(), ReaderError> {
-            self.begin_value(ValueType::Object)?;
+        async fn begin_object(&mut self) -> Result<(), ReaderError> {
+            self.begin_value(ValueType::Object).await?;
             match self.next_value.take().unwrap() {
                 Value::Object(map) => self.stack.push(StackValue::Object(map.iter().peekable())),
                 _ => unreachable!(),
@@ -149,7 +150,7 @@ mod custom_reader {
             Ok(())
         }
 
-        fn end_object(&mut self) -> Result<(), ReaderError> {
+        async fn end_object(&mut self) -> Result<(), ReaderError> {
             if self.next_value.is_some() {
                 panic!("Incorrect reader usage: Cannot end object; unconsumed value");
             }
@@ -175,8 +176,8 @@ mod custom_reader {
             }
         }
 
-        fn begin_array(&mut self) -> Result<(), ReaderError> {
-            self.begin_value(ValueType::Array)?;
+        async fn begin_array(&mut self) -> Result<(), ReaderError> {
+            self.begin_value(ValueType::Array).await?;
             match self.next_value.take().unwrap() {
                 Value::Array(vec) => self.stack.push(StackValue::Array(vec.iter().peekable())),
                 _ => unreachable!(),
@@ -186,7 +187,7 @@ mod custom_reader {
             Ok(())
         }
 
-        fn end_array(&mut self) -> Result<(), ReaderError> {
+        async fn end_array(&mut self) -> Result<(), ReaderError> {
             if let Some(StackValue::Array(iter)) = self.stack.last_mut() {
                 if iter.peek().is_some() {
                     Err(ReaderError::UnexpectedStructure {
@@ -205,7 +206,7 @@ mod custom_reader {
             }
         }
 
-        fn has_next(&mut self) -> Result<bool, ReaderError> {
+        async fn has_next(&mut self) -> Result<bool, ReaderError> {
             self.verify_string_reader_inactive();
 
             if let Some(stack_value) = self.stack.last_mut() {
@@ -224,7 +225,7 @@ mod custom_reader {
             }
         }
 
-        fn next_name(&mut self) -> Result<&str, ReaderError> {
+        async fn next_name(&mut self) -> Result<&str, ReaderError> {
             if self.expects_name {
                 let name;
                 match self.stack.last_mut().unwrap() {
@@ -254,12 +255,12 @@ mod custom_reader {
             }
         }
 
-        fn next_name_owned(&mut self) -> Result<String, ReaderError> {
-            self.next_name().map(str::to_owned)
+        async fn next_name_owned(&mut self) -> Result<String, ReaderError> {
+            self.next_name().await.map(str::to_owned)
         }
 
-        fn next_str(&mut self) -> Result<&str, ReaderError> {
-            self.begin_value(ValueType::String)?;
+        async fn next_str(&mut self) -> Result<&str, ReaderError> {
+            self.begin_value(ValueType::String).await?;
             if let Some(Value::String(s)) = self.next_value.take() {
                 self.end_value();
                 Ok(s.as_str())
@@ -268,12 +269,12 @@ mod custom_reader {
             }
         }
 
-        fn next_string(&mut self) -> Result<String, ReaderError> {
-            self.next_str().map(str::to_owned)
+        async fn next_string(&mut self) -> Result<String, ReaderError> {
+            self.next_str().await.map(str::to_owned)
         }
 
-        fn next_string_reader(&mut self) -> Result<impl Read + '_, ReaderError> {
-            self.begin_value(ValueType::String)?;
+        async fn next_string_reader(&mut self) -> Result<impl AsyncRead + '_, ReaderError> {
+            self.begin_value(ValueType::String).await?;
             if let Some(Value::String(s)) = self.next_value.take() {
                 self.is_string_value_reader_active = true;
                 Ok(StringValueReader {
@@ -286,11 +287,11 @@ mod custom_reader {
             }
         }
 
-        fn next_number_as_str(&mut self) -> Result<&str, ReaderError> {
-            self.begin_value(ValueType::Number)?;
+        async fn next_number_as_str(&mut self) -> Result<&str, ReaderError> {
+            self.begin_value(ValueType::Number).await?;
             if let Some(Value::Number(n)) = self.next_value.take() {
                 self.end_value();
-                // TODO: Is `to_string()` guaranteed to produce valid JSON numbers?
+                // TODO: Is `to_string()` guaranteed to produce valid JSON numbers.await?
                 self.number_str_buf = n.to_string();
                 Ok(&self.number_str_buf)
             } else {
@@ -298,12 +299,12 @@ mod custom_reader {
             }
         }
 
-        fn next_number_as_string(&mut self) -> Result<String, ReaderError> {
-            self.next_number_as_str().map(str::to_owned)
+        async fn next_number_as_string(&mut self) -> Result<String, ReaderError> {
+            self.next_number_as_str().await.map(str::to_owned)
         }
 
-        fn next_bool(&mut self) -> Result<bool, ReaderError> {
-            self.begin_value(ValueType::Boolean)?;
+        async fn next_bool(&mut self) -> Result<bool, ReaderError> {
+            self.begin_value(ValueType::Boolean).await?;
             if let Some(Value::Bool(b)) = self.next_value.take() {
                 self.end_value();
                 Ok(*b)
@@ -312,8 +313,8 @@ mod custom_reader {
             }
         }
 
-        fn next_null(&mut self) -> Result<(), ReaderError> {
-            self.begin_value(ValueType::Null)?;
+        async fn next_null(&mut self) -> Result<(), ReaderError> {
+            self.begin_value(ValueType::Null).await?;
             if let Some(Value::Null) = self.next_value.take() {
                 self.end_value();
                 Ok(())
@@ -323,7 +324,7 @@ mod custom_reader {
         }
 
         #[cfg(feature = "serde")]
-        fn deserialize_next<'de, D: serde::Deserialize<'de>>(
+        async fn deserialize_next<'de, D: serde::Deserialize<'de>>(
             &mut self,
         ) -> Result<D, struson::serde::DeserializerError> {
             // peek here to fail fast if reader is currently not expecting a value
@@ -335,17 +336,17 @@ mod custom_reader {
             //       JsonReaderDeserializer makes sure JSON arrays and objects are read completely
         }
 
-        fn skip_name(&mut self) -> Result<(), ReaderError> {
-            self.next_name()?;
+        async fn skip_name(&mut self) -> Result<(), ReaderError> {
+            self.next_name().await?;
             Ok(())
         }
 
-        fn skip_value(&mut self) -> Result<(), ReaderError> {
+        async fn skip_value(&mut self) -> Result<(), ReaderError> {
             // Peek to place value in `next_value`, and to verify that reader is in correct state to handle value
             // and not for example expects a name
-            let value_type = self.peek()?;
+            let value_type = self.peek().await?;
             // Call regular value handling method (to match other value consuming methods)
-            self.begin_value(value_type)?;
+            self.begin_value(value_type).await?;
             // Skip by clearing next value
             self.next_value = None;
             // Update reader state
@@ -354,14 +355,14 @@ mod custom_reader {
             Ok(())
         }
 
-        fn skip_to_top_level(&mut self) -> Result<(), ReaderError> {
+        async fn skip_to_top_level(&mut self) -> Result<(), ReaderError> {
             self.verify_string_reader_inactive();
 
             // Handle expected member value separately because has_next() calls below are not allowed when
             // member value is expected
             if let Some(StackValue::Object(_)) = self.stack.last() {
                 if self.next_value.is_some() {
-                    self.skip_value()?;
+                    self.skip_value().await?;
                 }
             }
 
@@ -371,62 +372,65 @@ mod custom_reader {
                     StackValue::Array(_) => {
                         // Replace with empty iter to allow directly ending array without having to consume remaining values
                         self.stack[last_element_index] = StackValue::Array([].iter().peekable());
-                        self.end_array()?;
+                        self.end_array().await?;
                     }
                     StackValue::Object(_) => {
                         // TODO: Could probably also implement this more efficiently by replacing `self.stack[last_element_index]`
                         // with empty iter (but cannot be `Map::new().iter()`, because this results in "temporary value dropped while borrowed")
-                        while self.has_next()? {
-                            self.skip_name()?;
-                            self.skip_value()?;
+                        while self.has_next().await? {
+                            self.skip_name().await?;
+                            self.skip_value().await?;
                         }
-                        self.end_object()?;
+                        self.end_object().await?;
                     }
                 }
             }
             Ok(())
         }
 
-        fn transfer_to<W: JsonWriter>(&mut self, json_writer: &mut W) -> Result<(), TransferError> {
+        async fn transfer_to<W: JsonWriter>(
+            &mut self,
+            json_writer: &mut W,
+        ) -> Result<(), TransferError> {
             if self.expects_name {
                 panic!("Incorrect reader usage: Cannot transfer value when expecting member name");
             }
 
             let mut depth: u32 = 0;
             loop {
-                if depth > 0 && !self.has_next()? {
+                if depth > 0 && !self.has_next().await? {
                     if let StackValue::Array(_) = self.stack.last().unwrap() {
-                        self.end_array()?;
-                        json_writer.end_array()?;
+                        self.end_array().await?;
+                        json_writer.end_array().await?;
                     } else {
-                        self.end_object()?;
-                        json_writer.end_object()?;
+                        self.end_object().await?;
+                        json_writer.end_object().await?;
                     }
                     depth -= 1;
                 } else {
                     if self.expects_name {
-                        let name = self.next_name()?;
-                        json_writer.name(name)?;
+                        let name = self.next_name().await?;
+                        json_writer.name(name).await?;
                     }
 
-                    match self.peek()? {
+                    match self.peek().await? {
                         ValueType::Array => {
-                            self.begin_array()?;
-                            json_writer.begin_array()?;
+                            self.begin_array().await?;
+                            json_writer.begin_array().await?;
                             depth += 1;
                         }
                         ValueType::Object => {
-                            self.begin_object()?;
-                            json_writer.begin_object()?;
+                            self.begin_object().await?;
+                            json_writer.begin_object().await?;
                             depth += 1;
                         }
                         ValueType::String => {
-                            json_writer.string_value(self.next_str()?)?;
+                            json_writer.string_value(self.next_str().await?).await?;
                         }
                         ValueType::Number => {
-                            let number = self.next_number_as_str()?;
+                            let number = self.next_number_as_str().await?;
                             // Should not fail since next_number_as_string would have returned Err for invalid JSON number
-                            if let Err(e) = json_writer.number_value_from_string(number) {
+                            if let Err(e) = json_writer.number_value_from_string(number).await {
                                 match e {
                                     JsonNumberError::InvalidNumber(e) => panic!("Unexpected: JSON writer rejected valid JSON number '{number}': {e}"),
                                     JsonNumberError::IoError(e) => return Err(TransferError::WriterError(e)),
@@ -434,11 +438,11 @@ mod custom_reader {
                             }
                         }
                         ValueType::Boolean => {
-                            json_writer.bool_value(self.next_bool()?)?;
+                            json_writer.bool_value(self.next_bool().await?).await?;
                         }
                         ValueType::Null => {
-                            self.next_null()?;
-                            json_writer.null_value()?;
+                            self.next_null().await?;
+                            json_writer.null_value().await?;
                         }
                     }
                 }
@@ -451,7 +455,7 @@ mod custom_reader {
             Ok(())
         }
 
-        fn consume_trailing_whitespace(self) -> Result<(), ReaderError> {
+        async fn consume_trailing_whitespace(self) -> Result<(), ReaderError> {
             self.verify_string_reader_inactive();
 
             if self.next_value.is_some() || !self.stack.is_empty() {
@@ -473,30 +477,39 @@ mod custom_reader {
         }
     }
 
-    struct StringValueReader<'j, 'a, R: Read> {
+    struct StringValueReader<'j, 'a, R: AsyncRead> {
         delegate: R,
         json_reader: &'j mut JsonValueReader<'a>,
         reached_end: bool,
     }
-    impl<R: Read> Read for StringValueReader<'_, '_, R> {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    impl<R: AsyncRead + Unpin> AsyncRead for StringValueReader<'_, '_, R> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut [u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
             if buf.is_empty() || self.reached_end {
-                return Ok(0);
+                return std::task::Poll::Ready(Ok(0));
             }
 
-            let n = self.delegate.read(buf)?;
+            let p = std::pin::Pin::new(&mut self.delegate);
+            let std::task::Poll::Ready(n) = p.poll_read(cx, buf) else {
+                return std::task::Poll::Pending;
+            };
+            let n = n?;
+
             if n == 0 {
                 self.reached_end = true;
                 self.json_reader.is_string_value_reader_active = false;
                 self.json_reader.end_value();
             }
-            Ok(n)
+            std::task::Poll::Ready(Ok(n))
         }
     }
 }
 
-#[test]
-fn read() -> Result<(), Box<dyn std::error::Error>> {
+#[futures_test::test]
+async fn read() -> Result<(), Box<dyn std::error::Error>> {
     let json = json!([
         {
             "name1": 1,
@@ -514,46 +527,46 @@ fn read() -> Result<(), Box<dyn std::error::Error>> {
     ]);
     let mut json_reader = JsonValueReader::new(&json);
 
-    assert_eq!(ValueType::Array, json_reader.peek()?);
-    json_reader.begin_array()?;
-    assert!(json_reader.has_next()?);
+    assert_eq!(ValueType::Array, json_reader.peek().await?);
+    json_reader.begin_array().await?;
+    assert!(json_reader.has_next().await?);
 
-    json_reader.begin_object()?;
-    assert!(json_reader.has_next()?);
-    assert_eq!("name1", json_reader.next_name()?);
-    assert_eq!(ValueType::Number, json_reader.peek()?);
-    assert_eq!("1", json_reader.next_number_as_str()?);
-    assert_eq!("name2", json_reader.next_name_owned()?);
-    assert_eq!("2", json_reader.next_number_as_str()?);
-    assert!(!json_reader.has_next()?);
-    json_reader.end_object()?;
+    json_reader.begin_object().await?;
+    assert!(json_reader.has_next().await?);
+    assert_eq!("name1", json_reader.next_name().await?);
+    assert_eq!(ValueType::Number, json_reader.peek().await?);
+    assert_eq!("1", json_reader.next_number_as_str().await?);
+    assert_eq!("name2", json_reader.next_name_owned().await?);
+    assert_eq!("2", json_reader.next_number_as_str().await?);
+    assert!(!json_reader.has_next().await?);
+    json_reader.end_object().await?;
 
-    assert_eq!("str1", json_reader.next_str()?);
-    assert_eq!("str2", json_reader.next_string()?);
+    assert_eq!("str1", json_reader.next_str().await?);
+    assert_eq!("str2", json_reader.next_string().await?);
 
     let mut string = String::new();
-    let mut string_reader = json_reader.next_string_reader()?;
-    string_reader.read_to_string(&mut string)?;
+    let mut string_reader = json_reader.next_string_reader().await?;
+    string_reader.read_to_string(&mut string).await?;
     drop(string_reader);
     assert_eq!("str3", string);
 
-    assert_eq!("1", json_reader.next_number_as_str()?);
-    assert_eq!("-2.3", json_reader.next_number_as_string()?);
-    assert_eq!(4_u32, json_reader.next_number::<u32>()??);
+    assert_eq!("1", json_reader.next_number_as_str().await?);
+    assert_eq!("-2.3", json_reader.next_number_as_string().await?);
+    assert_eq!(4_u32, json_reader.next_number::<u32>().await??);
 
-    json_reader.next_null()?;
+    json_reader.next_null().await?;
 
-    assert_eq!(true, json_reader.next_bool()?);
-    assert_eq!(false, json_reader.next_bool()?);
+    assert_eq!(true, json_reader.next_bool().await?);
+    assert_eq!(false, json_reader.next_bool().await?);
 
-    assert!(!json_reader.has_next()?);
-    json_reader.end_array()?;
-    json_reader.consume_trailing_whitespace()?;
+    assert!(!json_reader.has_next().await?);
+    json_reader.end_array().await?;
+    json_reader.consume_trailing_whitespace().await?;
     Ok(())
 }
 
-#[test]
-fn skip() -> Result<(), Box<dyn std::error::Error>> {
+#[futures_test::test]
+async fn skip() -> Result<(), Box<dyn std::error::Error>> {
     let json = json!([
         1,
         null,
@@ -578,33 +591,33 @@ fn skip() -> Result<(), Box<dyn std::error::Error>> {
     ]);
     let mut json_reader = JsonValueReader::new(&json);
 
-    json_reader.begin_array()?;
-    assert_eq!("1", json_reader.next_number_as_str()?);
-    json_reader.skip_value()?;
+    json_reader.begin_array().await?;
+    assert_eq!("1", json_reader.next_number_as_str().await?);
+    json_reader.skip_value().await?;
 
-    assert_eq!("2", json_reader.next_number_as_str()?);
-    json_reader.skip_value()?;
+    assert_eq!("2", json_reader.next_number_as_str().await?);
+    json_reader.skip_value().await?;
 
-    assert_eq!("3", json_reader.next_number_as_str()?);
-    json_reader.skip_value()?;
+    assert_eq!("3", json_reader.next_number_as_str().await?);
+    json_reader.skip_value().await?;
 
-    assert_eq!("4", json_reader.next_number_as_str()?);
-    json_reader.begin_object()?;
-    json_reader.skip_name()?;
-    assert_eq!("1", json_reader.next_number_as_str()?);
-    assert_eq!("name2", json_reader.next_name()?);
-    json_reader.skip_value()?;
-    json_reader.end_object()?;
+    assert_eq!("4", json_reader.next_number_as_str().await?);
+    json_reader.begin_object().await?;
+    json_reader.skip_name().await?;
+    assert_eq!("1", json_reader.next_number_as_str().await?);
+    assert_eq!("name2", json_reader.next_name().await?);
+    json_reader.skip_value().await?;
+    json_reader.end_object().await?;
 
-    assert_eq!("5", json_reader.next_number_as_str()?);
-    json_reader.skip_value()?;
+    assert_eq!("5", json_reader.next_number_as_str().await?);
+    json_reader.skip_value().await?;
 
-    assert_eq!("6", json_reader.next_number_as_str()?);
+    assert_eq!("6", json_reader.next_number_as_str().await?);
     Ok(())
 }
 
-#[test]
-fn seek_to() -> Result<(), Box<dyn std::error::Error>> {
+#[futures_test::test]
+async fn seek_to() -> Result<(), Box<dyn std::error::Error>> {
     let json = json!([
         true,
         false,
@@ -620,20 +633,22 @@ fn seek_to() -> Result<(), Box<dyn std::error::Error>> {
         1,
     ]);
     let mut json_reader = JsonValueReader::new(&json);
-    json_reader.seek_to(&json_path![2, "name2", 0, "name3"])?;
+    json_reader
+        .seek_to(&json_path![2, "name2", 0, "name3"])
+        .await?;
     assert_eq!(
         json_path![2, "name2", 0, "name3"],
         &json_reader.json_path as &JsonPath
     );
-    assert_eq!("4", json_reader.next_number_as_str()?);
+    assert_eq!("4", json_reader.next_number_as_str().await?);
 
-    json_reader.skip_to_top_level()?;
-    json_reader.consume_trailing_whitespace()?;
+    json_reader.skip_to_top_level().await?;
+    json_reader.consume_trailing_whitespace().await?;
     Ok(())
 }
 
-#[test]
-fn transfer() -> Result<(), Box<dyn std::error::Error>> {
+#[futures_test::test]
+async fn transfer() -> Result<(), Box<dyn std::error::Error>> {
     let json = json!([
         true,
         false,
@@ -652,9 +667,9 @@ fn transfer() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut writer = Vec::new();
     let mut json_writer = JsonStreamWriter::new(&mut writer);
-    json_reader.transfer_to(&mut json_writer)?;
-    json_reader.consume_trailing_whitespace()?;
-    json_writer.finish_document()?;
+    json_reader.transfer_to(&mut json_writer).await?;
+    json_reader.consume_trailing_whitespace().await?;
+    json_writer.finish_document().await?;
 
     assert_eq!(
         "[true,false,{\"name1\":null,\"name2\":[{\"name3\":4}],\"name4\":true},1]",
@@ -663,8 +678,8 @@ fn transfer() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[test]
-fn unexpected_structure() -> Result<(), Box<dyn std::error::Error>> {
+#[futures_test::test]
+async fn unexpected_structure() -> Result<(), Box<dyn std::error::Error>> {
     macro_rules! assert_unexpected_structure {
         ($value:expr, $kind:pat_param, {$assertion:expr}) => {
             // Separate block to drop result of `next_string_reader` properly after assertion
@@ -684,62 +699,62 @@ fn unexpected_structure() -> Result<(), Box<dyn std::error::Error>> {
 
     let json = json!([1]);
     let mut json_reader = JsonValueReader::new(&json);
-    json_reader.begin_array()?;
+    json_reader.begin_array().await?;
     assert_unexpected_structure!(
-        json_reader.end_array(),
+        json_reader.end_array().await,
         UnexpectedStructureKind::MoreElementsThanExpected
     );
-    json_reader.skip_value()?;
+    json_reader.skip_value().await?;
     assert_unexpected_structure!(
-        json_reader.peek(),
+        json_reader.peek().await,
         UnexpectedStructureKind::FewerElementsThanExpected
     );
     assert_unexpected_structure!(
-        json_reader.skip_value(),
+        json_reader.skip_value().await,
         UnexpectedStructureKind::FewerElementsThanExpected
     );
     assert_unexpected_structure!(
-        json_reader.next_bool(),
+        json_reader.next_bool().await,
         UnexpectedStructureKind::FewerElementsThanExpected
     );
     assert_unexpected_structure!(
-        json_reader.next_string_reader(),
+        json_reader.next_string_reader().await,
         UnexpectedStructureKind::FewerElementsThanExpected
     );
-    json_reader.end_array()?;
-    json_reader.consume_trailing_whitespace()?;
+    json_reader.end_array().await?;
+    json_reader.consume_trailing_whitespace().await?;
 
     let json = json!({"a": 1});
     let mut json_reader = JsonValueReader::new(&json);
-    json_reader.begin_object()?;
+    json_reader.begin_object().await?;
     assert_unexpected_structure!(
-        json_reader.end_object(),
+        json_reader.end_object().await,
         UnexpectedStructureKind::MoreElementsThanExpected
     );
-    json_reader.skip_name()?;
-    json_reader.skip_value()?;
+    json_reader.skip_name().await?;
+    json_reader.skip_value().await?;
     assert_unexpected_structure!(
-        json_reader.skip_name(),
+        json_reader.skip_name().await,
         UnexpectedStructureKind::FewerElementsThanExpected
     );
     assert_unexpected_structure!(
-        json_reader.next_name(),
+        json_reader.next_name().await,
         UnexpectedStructureKind::FewerElementsThanExpected
     );
-    json_reader.end_object()?;
-    json_reader.consume_trailing_whitespace()?;
+    json_reader.end_object().await?;
+    json_reader.consume_trailing_whitespace().await?;
 
     let json = json!([]);
     let mut json_reader = JsonValueReader::new(&json);
     assert_unexpected_structure!(
-        json_reader.seek_to(&json_path![0]),
+        json_reader.seek_to(&json_path![0]).await,
         UnexpectedStructureKind::TooShortArray { expected_index: 0 }
     );
 
     let json = json!({});
     let mut json_reader = JsonValueReader::new(&json);
     assert_unexpected_structure!(
-        json_reader.seek_to(&json_path!["a"]),
+        json_reader.seek_to(&json_path!["a"]).await,
         UnexpectedStructureKind::MissingObjectMember { member_name },
         { assert_eq!("a", member_name) }
     );
@@ -747,8 +762,8 @@ fn unexpected_structure() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[test]
-fn unexpected_value_type() -> Result<(), Box<dyn std::error::Error>> {
+#[futures_test::test]
+async fn unexpected_value_type() -> Result<(), Box<dyn std::error::Error>> {
     macro_rules! assert_unexpected_value_type {
         ($value:expr, $expected:ident, $actual:ident) => {
             // Separate block to drop result of `next_string_reader` properly after assertion
@@ -769,20 +784,20 @@ fn unexpected_value_type() -> Result<(), Box<dyn std::error::Error>> {
 
     let json = json!(1);
     let mut json_reader = JsonValueReader::new(&json);
-    assert_unexpected_value_type!(json_reader.begin_array(), Array, Number);
-    assert_unexpected_value_type!(json_reader.begin_object(), Object, Number);
-    assert_unexpected_value_type!(json_reader.next_str(), String, Number);
-    assert_unexpected_value_type!(json_reader.next_string_reader(), String, Number);
+    assert_unexpected_value_type!(json_reader.begin_array().await, Array, Number);
+    assert_unexpected_value_type!(json_reader.begin_object().await, Object, Number);
+    assert_unexpected_value_type!(json_reader.next_str().await, String, Number);
+    assert_unexpected_value_type!(json_reader.next_string_reader().await, String, Number);
 
-    assert_unexpected_value_type!(json_reader.seek_to(&json_path![0]), Array, Number);
-    assert_unexpected_value_type!(json_reader.seek_to(&json_path!["a"]), Object, Number);
+    assert_unexpected_value_type!(json_reader.seek_to(&json_path![0]).await, Array, Number);
+    assert_unexpected_value_type!(json_reader.seek_to(&json_path!["a"]).await, Object, Number);
 
     Ok(())
 }
 
 #[cfg(feature = "serde")]
-#[test]
-fn deserialize() -> Result<(), Box<dyn std::error::Error>> {
+#[futures_test::test]
+async fn deserialize() -> Result<(), Box<dyn std::error::Error>> {
     use serde::Deserialize;
 
     #[derive(Deserialize, PartialEq, Debug)]
@@ -795,9 +810,9 @@ fn deserialize() -> Result<(), Box<dyn std::error::Error>> {
     });
     let mut json_reader = JsonValueReader::new(&json);
 
-    let deserialized: CustomStruct = json_reader.deserialize_next()?;
+    let deserialized: CustomStruct = json_reader.deserialize_next().await?;
     assert_eq!(CustomStruct { a: 1 }, deserialized);
 
-    json_reader.consume_trailing_whitespace()?;
+    json_reader.consume_trailing_whitespace().await?;
     Ok(())
 }

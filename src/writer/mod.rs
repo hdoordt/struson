@@ -3,7 +3,8 @@
 //! [`JsonWriter`] is the general trait for JSON writers, [`JsonStreamWriter`] is an implementation
 //! of it which writes a JSON document to a [`Write`] in a streaming way.
 
-use std::{fmt::Debug, io::Write};
+use futures::io::{AsyncWrite, AsyncWriteExt};
+use std::fmt::{Debug, Display};
 
 use duplicate::duplicate_item;
 use thiserror::Error;
@@ -120,7 +121,7 @@ pub trait JsonWriter {
     /// when called after the top-level value has already been written and multiple top-level
     /// values are not enabled in the [`WriterSettings`]. Both cases indicate incorrect
     /// usage by the user.
-    fn begin_object(&mut self) -> Result<(), IoError>;
+    async fn begin_object(&mut self) -> Result<(), IoError>;
 
     /// Writes the closing bracket `}` of the current JSON object
     ///
@@ -130,7 +131,7 @@ pub trait JsonWriter {
     /// Panics when called on a JSON writer which is currently not inside a JSON object,
     /// or when the value of a member is currently expected. Both cases indicate incorrect
     /// usage by the user.
-    fn end_object(&mut self) -> Result<(), IoError>;
+    async fn end_object(&mut self) -> Result<(), IoError>;
 
     /// Begins writing a JSON array
     ///
@@ -162,7 +163,7 @@ pub trait JsonWriter {
     /// when called after the top-level value has already been written and multiple top-level
     /// values are not enabled in the [`WriterSettings`]. Both cases indicate incorrect
     /// usage by the user.
-    fn begin_array(&mut self) -> Result<(), IoError>;
+    async fn begin_array(&mut self) -> Result<(), IoError>;
 
     /// Writes the closing bracket `]` of the current JSON object
     ///
@@ -171,7 +172,7 @@ pub trait JsonWriter {
     /// # Panics
     /// Panics when called on a JSON writer which is currently not inside a JSON array.
     /// This indicates incorrect usage by the user.
-    fn end_array(&mut self) -> Result<(), IoError>;
+    async fn end_array(&mut self) -> Result<(), IoError>;
 
     /// Writes the name of the next JSON object member
     ///
@@ -207,7 +208,7 @@ pub trait JsonWriter {
     /// # Panics
     /// Panics when called on a JSON writer which currently does not expect a member name. This
     /// indicates incorrect usage by the user.
-    fn name(&mut self, name: &str) -> Result<(), IoError>;
+    async fn name(&mut self, name: &str) -> Result<(), IoError>;
 
     /// Writes a JSON null value
     ///
@@ -234,7 +235,7 @@ pub trait JsonWriter {
     /// when called after the top-level value has already been written and multiple top-level
     /// values are not enabled in the [`WriterSettings`]. Both cases indicate incorrect
     /// usage by the user.
-    fn null_value(&mut self) -> Result<(), IoError>;
+    async fn null_value(&mut self) -> Result<(), IoError>;
 
     /// Writes a JSON boolean value
     ///
@@ -258,7 +259,7 @@ pub trait JsonWriter {
     /// when called after the top-level value has already been written and multiple top-level
     /// values are not enabled in the [`WriterSettings`]. Both cases indicate incorrect
     /// usage by the user.
-    fn bool_value(&mut self, value: bool) -> Result<(), IoError>;
+    async fn bool_value(&mut self, value: bool) -> Result<(), IoError>;
 
     /// Writes a JSON string value
     ///
@@ -292,7 +293,7 @@ pub trait JsonWriter {
     /// when called after the top-level value has already been written and multiple top-level
     /// values are not enabled in the [`WriterSettings`]. Both cases indicate incorrect
     /// usage by the user.
-    fn string_value(&mut self, value: &str) -> Result<(), IoError>;
+    async fn string_value(&mut self, value: &str) -> Result<(), IoError>;
 
     /// Provides a writer for lazily writing a JSON string value
     ///
@@ -344,7 +345,8 @@ pub trait JsonWriter {
     /// when called after the top-level value has already been written and multiple top-level
     /// values are not enabled in the [`WriterSettings`]. Both cases indicate incorrect
     /// usage by the user.
-    fn string_value_writer(&mut self) -> Result<impl StringValueWriter + '_, IoError>;
+    async fn string_value_writer(&mut self)
+        -> Result<impl StringValueWriter + Unpin + '_, IoError>;
 
     /// Writes the string representation of a JSON number value
     ///
@@ -384,7 +386,7 @@ pub trait JsonWriter {
      *   Though that might make usage of the writer more cumbersome.
      * TODO: Rename to `number_string_value`?
      */
-    fn number_value_from_string(&mut self, value: &str) -> Result<(), JsonNumberError>;
+    async fn number_value_from_string(&mut self, value: &str) -> Result<(), JsonNumberError>;
 
     /// Writes a finite JSON number value
     ///
@@ -412,7 +414,7 @@ pub trait JsonWriter {
     /// when called after the top-level value has already been written and multiple top-level
     /// values are not enabled in the [`WriterSettings`]. Both cases indicate incorrect
     /// usage by the user.
-    fn number_value<N: FiniteNumber>(&mut self, value: N) -> Result<(), IoError>;
+    async fn number_value<N: FiniteNumber + Display>(&mut self, value: N) -> Result<(), IoError>;
 
     /// Writes a floating point JSON number value
     ///
@@ -451,7 +453,10 @@ pub trait JsonWriter {
      * TODO: Maybe give this method a better name?
      * TODO: Maybe also support writing in scientific notation? e.g. `4.1e20`, see also https://doc.rust-lang.org/std/fmt/trait.LowerExp.html
      */
-    fn fp_number_value<N: FloatingPointNumber>(&mut self, value: N) -> Result<(), JsonNumberError>;
+    async fn fp_number_value<N: FloatingPointNumber + Display>(
+        &mut self,
+        value: N,
+    ) -> Result<(), JsonNumberError>;
 
     /// Serializes a Serde [`Serialize`](serde::ser::Serialize) as next value
     ///
@@ -513,7 +518,7 @@ pub trait JsonWriter {
     /// values are not enabled in the [`WriterSettings`]. Both cases indicate incorrect
     /// usage by the user.
     #[cfg(feature = "serde")]
-    fn serialize_value<S: serde::ser::Serialize>(
+    async fn serialize_value<S: serde::ser::Serialize>(
         &mut self,
         value: &S,
     ) -> Result<(), crate::serde::SerializerError>;
@@ -541,7 +546,7 @@ pub trait JsonWriter {
      * on JsonWriter as result type; then custom JsonWriter implementations which produce a
      * value can return it here.
      */
-    fn finish_document(self) -> Result<(), IoError>;
+    async fn finish_document(self) -> Result<(), IoError>;
 }
 
 /// Writer for lazily writing a JSON string value
@@ -564,7 +569,7 @@ pub trait JsonWriter {
 ///   trying to use the string writer or the underlying JSON writer afterwards will lead
 ///   to unspecified behavior
 /* Note: Dropping writer will not automatically finish value since that would silently discard errors which might occur */
-pub trait StringValueWriter: Write {
+pub trait StringValueWriter: AsyncWrite {
     /// Writes a string value piece
     ///
     /// This method behaves the same way as if the string bytes were written using
@@ -602,11 +607,14 @@ pub trait StringValueWriter: Write {
     /// assert_eq!(json, "\"one, two, three and four\"");
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    fn write_str(&mut self, s: &str) -> Result<(), IoError> {
+    async fn write_str(&mut self, s: &str) -> Result<(), IoError>
+    where
+        Self: Unpin,
+    {
         // write_all retries on `ErrorKind::Interrupted`, as desired
         // this is mostly relevant for custom JsonWriter implementations, for JsonStreamWriter it
         // should not matter because it is not expected to return `Interrupted`, see also tests there
-        self.write_all(s.as_bytes())
+        self.write_all(s.as_bytes()).await
     }
 
     /// Finishes the JSON string value
@@ -614,26 +622,40 @@ pub trait StringValueWriter: Write {
     /// This method must be called when writing the string value is done to allow
     /// using the original JSON writer again.
     /* Consumes 'self' */
-    fn finish_value(self) -> Result<(), IoError>;
+    async fn finish_value(self) -> Result<(), IoError>;
 }
 
 /// [`StringValueWriter`] which is unreachable
 pub(crate) struct UnreachableStringValueWriter;
-impl Write for UnreachableStringValueWriter {
-    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+impl AsyncWrite for UnreachableStringValueWriter {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
         unreachable!()
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        unreachable!()
+    }
+
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
         unreachable!()
     }
 }
 impl StringValueWriter for UnreachableStringValueWriter {
-    fn write_str(&mut self, _: &str) -> Result<(), IoError> {
+    async fn write_str(&mut self, _: &str) -> Result<(), IoError> {
         unreachable!()
     }
 
-    fn finish_value(self) -> Result<(), IoError> {
+    async fn finish_value(self) -> Result<(), IoError> {
         unreachable!()
     }
 }
@@ -646,15 +668,7 @@ impl StringValueWriter for UnreachableStringValueWriter {
 /// Implementing this trait for custom number types is not possible. Use the
 /// method [`JsonWriter::number_value_from_string`] to write them to the JSON
 /// document.
-pub trait FiniteNumber: private::Sealed {
-    /// Converts this number to a JSON number string
-    ///
-    /// The JSON number string is passed to the given `consumer`.
-    fn use_json_number<C: FnOnce(&str) -> Result<(), IoError>>(
-        &self,
-        consumer: C,
-    ) -> Result<(), IoError>;
-
+pub trait FiniteNumber: Display + private::Sealed {
     /// Gets this number as `u64`
     ///
     /// If this number can be losslessly and relatively efficiently converted
@@ -679,17 +693,8 @@ pub trait FiniteNumber: private::Sealed {
 /// Implementing this trait for custom number types is not possible. Use the
 /// method [`JsonWriter::number_value_from_string`] to write them to the JSON
 /// document.
-pub trait FloatingPointNumber: private::Sealed {
-    /// Converts this number to a JSON number string
-    ///
-    /// The JSON number string is passed to the given `consumer`.
-    /// Returns an error if this number is not a valid JSON number, for example
-    /// because it is NaN or Infinity.
-    fn use_json_number<C: FnOnce(&str) -> Result<(), IoError>>(
-        &self,
-        consumer: C,
-    ) -> Result<(), JsonNumberError>;
-
+pub trait FloatingPointNumber: Display + private::Sealed {
+    fn validate(&self) -> Result<(), JsonNumberError>;
     /// Gets this number as `f64`
     ///
     /// If this number can be losslessly and relatively efficiently converted
@@ -730,20 +735,6 @@ pub enum JsonNumberError {
 // Use `duplicate` crate to avoid repeating code for all supported types, see https://stackoverflow.com/a/61467564
 #[duplicate_item(type_template; [u8]; [i8]; [u16]; [i16]; [u32]; [i32]; [u64]; [i64]; [u128]; [i128]; [usize]; [isize])]
 impl FiniteNumber for type_template {
-    #[inline(always)]
-    fn use_json_number<C: FnOnce(&str) -> Result<(), IoError>>(
-        &self,
-        consumer: C,
-    ) -> Result<(), IoError> {
-        // TODO: Use https://docs.rs/itoa/latest/itoa/ for better performance? (used also by serde_json)
-        let string = self.to_string();
-        debug_assert!(
-            is_valid_json_number(&string),
-            "Unexpected: Not a valid JSON number: {string}"
-        );
-        consumer(&string)
-    }
-
     fn as_u64(&self) -> Option<u64> {
         // TODO: Should this only use `into()` and for all unsupported types (e.g. signed or u128, ...) always return None?
         #[allow(clippy::useless_conversion, clippy::unnecessary_fallible_conversions /* reason = "for u64 -> u64" */)]
@@ -759,20 +750,8 @@ impl FiniteNumber for type_template {
 
 #[duplicate_item(type_template; [f32]; [f64])]
 impl FloatingPointNumber for type_template {
-    #[inline(always)]
-    fn use_json_number<C: FnOnce(&str) -> Result<(), IoError>>(
-        &self,
-        consumer: C,
-    ) -> Result<(), JsonNumberError> {
+    fn validate(&self) -> Result<(), JsonNumberError> {
         if self.is_finite() {
-            // TODO: Use https://docs.rs/ryu/latest/ryu/ for better performance? (used also by serde_json)
-            //   Have to adjust `fp_number_value` documentation then, currently mentions usage of `to_string`
-            let string = self.to_string();
-            debug_assert!(
-                is_valid_json_number(&string),
-                "Unexpected: Not a valid JSON number: {string}"
-            );
-            consumer(&string)?;
             Ok(())
         } else {
             Err(JsonNumberError::InvalidNumber(format!(
@@ -792,14 +771,12 @@ impl FloatingPointNumber for type_template {
 #[derive(Debug)]
 pub(crate) struct TransferredNumber<'a>(pub &'a str);
 impl private::Sealed for TransferredNumber<'_> {}
-impl FiniteNumber for TransferredNumber<'_> {
-    fn use_json_number<C: FnOnce(&str) -> Result<(), IoError>>(
-        &self,
-        consumer: C,
-    ) -> Result<(), IoError> {
-        consumer(self.0)
+impl<'a> Display for TransferredNumber<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
-
+}
+impl FiniteNumber for TransferredNumber<'_> {
     fn as_u64(&self) -> Option<u64> {
         None
     }
@@ -814,82 +791,54 @@ mod tests {
     use super::*;
     use std::fmt::Display;
 
-    #[test]
-    fn numbers_strings() {
-        fn assert_valid_number<T: FiniteNumber + Display>(number: T) {
+    #[futures_test::test]
+    async fn numbers_strings() {
+        async fn assert_valid_number<T: FiniteNumber + Display>(number: T) {
             let mut number_string = String::new();
-            number
-                .use_json_number(|json_number| {
-                    number_string.push_str(json_number);
-                    Ok(())
-                })
-                .unwrap();
+            let json_number = number.to_string();
+            number_string.push_str(&json_number);
 
             assert_eq!(
                 true,
-                is_valid_json_number(&number_string),
+                is_valid_json_number(&number_string).await,
                 "Expected to be valid JSON number: {}",
                 number
             );
         }
 
-        assert_valid_number(i8::MIN);
-        assert_valid_number(i8::MAX);
-        assert_valid_number(u8::MAX);
+        assert_valid_number(i8::MIN).await;
+        assert_valid_number(i8::MAX).await;
+        assert_valid_number(u8::MAX).await;
 
-        assert_valid_number(i128::MIN);
-        assert_valid_number(i128::MAX);
-        assert_valid_number(u128::MAX);
+        assert_valid_number(i128::MIN).await;
+        assert_valid_number(i128::MAX).await;
+        assert_valid_number(u128::MAX).await;
 
-        assert_valid_number(isize::MIN);
-        assert_valid_number(isize::MAX);
-        assert_valid_number(usize::MAX);
+        assert_valid_number(isize::MIN).await;
+        assert_valid_number(isize::MAX).await;
+        assert_valid_number(usize::MAX).await;
 
-        fn assert_valid_fp_number<T: FloatingPointNumber + Display>(number: T) {
+        async fn assert_valid_fp_number<T: FloatingPointNumber + Display>(number: T) {
             let mut number_string = String::new();
-            number
-                .use_json_number(|json_number| {
-                    number_string.push_str(json_number);
-                    Ok(())
-                })
-                .unwrap();
+            let json_number = number.to_string();
+            number_string.push_str(&json_number);
 
             assert_eq!(
                 true,
-                is_valid_json_number(&number_string),
+                is_valid_json_number(&number_string).await,
                 "Expected to be valid JSON number: {}",
                 number
             );
         }
 
-        assert_valid_fp_number(f32::MIN);
-        assert_valid_fp_number(f32::MIN_POSITIVE);
-        assert_valid_fp_number(-f32::MIN_POSITIVE);
-        assert_valid_fp_number(f32::MAX);
+        assert_valid_fp_number(f32::MIN).await;
+        assert_valid_fp_number(f32::MIN_POSITIVE).await;
+        assert_valid_fp_number(-f32::MIN_POSITIVE).await;
+        assert_valid_fp_number(f32::MAX).await;
 
-        assert_valid_fp_number(f64::MIN);
-        assert_valid_fp_number(f64::MIN_POSITIVE);
-        assert_valid_fp_number(-f64::MIN_POSITIVE);
-        assert_valid_fp_number(f64::MAX);
-
-        fn assert_non_finite<T: FloatingPointNumber + Display>(number: T) {
-            match number.use_json_number(|_| panic!("Should have failed for: {number}")) {
-                Ok(_) => panic!("Should have failed for: {number}"),
-                Err(e) => match e {
-                    JsonNumberError::InvalidNumber(message) => {
-                        assert_eq!(format!("non-finite number: {number}"), message)
-                    }
-                    JsonNumberError::IoError(e) => panic!("Unexpected error for '{number}': {e:?}"),
-                },
-            }
-        }
-
-        assert_non_finite(f32::NAN);
-        assert_non_finite(f32::NEG_INFINITY);
-        assert_non_finite(f32::INFINITY);
-
-        assert_non_finite(f64::NAN);
-        assert_non_finite(f64::NEG_INFINITY);
-        assert_non_finite(f64::INFINITY);
+        assert_valid_fp_number(f64::MIN).await;
+        assert_valid_fp_number(f64::MIN_POSITIVE).await;
+        assert_valid_fp_number(-f64::MIN_POSITIVE).await;
+        assert_valid_fp_number(f64::MAX).await;
     }
 }

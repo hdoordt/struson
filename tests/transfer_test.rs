@@ -11,8 +11,8 @@ use crate::test_lib::get_test_data_file_path;
 #[allow(dead_code)]
 mod test_lib;
 
-#[test]
-fn transfer_test() -> Result<(), Box<dyn Error>> {
+#[futures_test::test]
+async fn transfer_test() -> Result<(), Box<dyn Error>> {
     let expected_json = read_to_string(get_test_data_file_path())?;
     // Normalize JSON document string
     let expected_json = expected_json.replace('\r', "");
@@ -30,16 +30,16 @@ fn transfer_test() -> Result<(), Box<dyn Error>> {
     );
 
     // First wrap and transfer JSON document
-    json_writer.begin_object()?;
-    json_writer.name("nested")?;
-    json_writer.begin_array()?;
+    json_writer.begin_object().await?;
+    json_writer.name("nested").await?;
+    json_writer.begin_array().await?;
 
-    json_reader.transfer_to(&mut json_writer)?;
-    json_reader.consume_trailing_whitespace()?;
+    json_reader.transfer_to(&mut json_writer).await?;
+    json_reader.consume_trailing_whitespace().await?;
 
-    json_writer.end_array()?;
-    json_writer.end_object()?;
-    json_writer.finish_document()?;
+    json_writer.end_array().await?;
+    json_writer.end_object().await?;
+    json_writer.finish_document().await?;
 
     let intermediate_json = String::from_utf8(writer)?;
 
@@ -55,12 +55,12 @@ fn transfer_test() -> Result<(), Box<dyn Error>> {
     );
 
     // Then unwrap it again
-    json_reader.seek_to(&json_path!["nested", 0])?;
-    json_reader.transfer_to(&mut json_writer)?;
-    json_reader.skip_to_top_level()?;
-    json_reader.consume_trailing_whitespace()?;
+    json_reader.seek_to(&json_path!["nested", 0]).await?;
+    json_reader.transfer_to(&mut json_writer).await?;
+    json_reader.skip_to_top_level().await?;
+    json_reader.consume_trailing_whitespace().await?;
 
-    json_writer.finish_document()?;
+    json_writer.finish_document().await?;
 
     assert_eq!(expected_json, String::from_utf8(writer)?);
 

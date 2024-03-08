@@ -3,6 +3,8 @@
 //! [`JsonReader`] is the general trait for JSON readers, [`JsonStreamReader`] is an implementation
 //! of it which reads a JSON document from a [`Read`] in a streaming way.
 
+use futures::{AsyncRead, AsyncReadExt};
+
 /// Module for 'JSON path'
 ///
 /// A 'JSON path' points to a single value in a JSON document. It consists of zero or more [`JsonPathPiece`]
@@ -433,7 +435,6 @@ pub mod json_path {
 
 use std::{
     fmt::{Debug, Display, Formatter},
-    io::Read,
     str::FromStr,
 };
 
@@ -991,7 +992,7 @@ pub trait JsonReader {
     /// values are not enabled in the [`ReaderSettings`]. Both cases indicate incorrect
     /// usage by the user and are unrelated to the JSON data.
     /* TODO: Rename to peek_value (or peek_value_type)? */
-    fn peek(&mut self) -> Result<ValueType, ReaderError>;
+    async fn peek(&mut self) -> Result<ValueType, ReaderError>;
 
     /// Begins consuming a JSON object
     ///
@@ -1032,7 +1033,7 @@ pub trait JsonReader {
     /// when called after the top-level value has already been consumed and multiple top-level
     /// values are not enabled in the [`ReaderSettings`]. Both cases indicate incorrect
     /// usage by the user and are unrelated to the JSON data.
-    fn begin_object(&mut self) -> Result<(), ReaderError>;
+    async fn begin_object(&mut self) -> Result<(), ReaderError>;
 
     /// Consumes the closing bracket `}` of the current JSON object
     ///
@@ -1063,7 +1064,7 @@ pub trait JsonReader {
     /// Panics when called on a JSON reader which is currently not inside a JSON object,
     /// or when the value of a member is currently expected. Both cases indicate incorrect
     /// usage by the user and are unrelated to the JSON data.
-    fn end_object(&mut self) -> Result<(), ReaderError>;
+    async fn end_object(&mut self) -> Result<(), ReaderError>;
 
     /// Begins consuming a JSON array
     ///
@@ -1105,7 +1106,7 @@ pub trait JsonReader {
     /// when called after the top-level value has already been consumed and multiple top-level
     /// values are not enabled in the [`ReaderSettings`]. Both cases indicate incorrect
     /// usage by the user and are unrelated to the JSON data.
-    fn begin_array(&mut self) -> Result<(), ReaderError>;
+    async fn begin_array(&mut self) -> Result<(), ReaderError>;
 
     /// Consumes the closing bracket `]` of the current JSON array
     ///
@@ -1131,7 +1132,7 @@ pub trait JsonReader {
     /// # Panics
     /// Panics when called on a JSON reader which is currently not inside a JSON array. This
     /// indicates incorrect usage by the user and is unrelated to the JSON data.
-    fn end_array(&mut self) -> Result<(), ReaderError>;
+    async fn end_array(&mut self) -> Result<(), ReaderError>;
 
     /// Checks if there is a next element in the current JSON array or object, without consuming it
     ///
@@ -1166,7 +1167,7 @@ pub trait JsonReader {
     /// Additionally this method also panics when called on a JSON reader which has not
     /// consumed any top-level value yet. An empty JSON document is not valid so there
     /// should be no need to check for a next element since there must always be one.
-    fn has_next(&mut self) -> Result<bool, ReaderError>;
+    async fn has_next(&mut self) -> Result<bool, ReaderError>;
 
     /// Consumes and returns the name of the next JSON object member as `str`
     ///
@@ -1202,7 +1203,7 @@ pub trait JsonReader {
     /// # Panics
     /// Panics when called on a JSON reader which currently does not expect a member name. This
     /// indicates incorrect usage by the user and is unrelated to the JSON data.
-    fn next_name(&mut self) -> Result<&str, ReaderError>;
+    async fn next_name(&mut self) -> Result<&str, ReaderError>;
 
     /// Consumes and returns the name of the next JSON object member as `String`
     ///
@@ -1212,7 +1213,7 @@ pub trait JsonReader {
     ///
     /// See the documentation of [`next_name`](Self::next_name) for a detailed
     /// description of the behavior of reading a member name.
-    fn next_name_owned(&mut self) -> Result<String, ReaderError>;
+    async fn next_name_owned(&mut self) -> Result<String, ReaderError>;
 
     /// Consumes and returns a JSON string value as `str`
     ///
@@ -1252,7 +1253,7 @@ pub trait JsonReader {
     /// when called after the top-level value has already been consumed and multiple top-level
     /// values are not enabled in the [`ReaderSettings`]. Both cases indicate incorrect
     /// usage by the user and are unrelated to the JSON data.
-    fn next_str(&mut self) -> Result<&str, ReaderError>;
+    async fn next_str(&mut self) -> Result<&str, ReaderError>;
 
     /// Consumes and returns a JSON string value as `String`
     ///
@@ -1262,7 +1263,7 @@ pub trait JsonReader {
     ///
     /// See the documentation of [`next_str`](Self::next_str) for a detailed
     /// description of the behavior of reading a string value.
-    fn next_string(&mut self) -> Result<String, ReaderError>;
+    async fn next_string(&mut self) -> Result<String, ReaderError>;
 
     /// Provides a reader for lazily reading a JSON string value
     ///
@@ -1327,7 +1328,7 @@ pub trait JsonReader {
     /// when called after the top-level value has already been consumed and multiple top-level
     /// values are not enabled in the [`ReaderSettings`]. Both cases indicate incorrect
     /// usage by the user and are unrelated to the JSON data.
-    fn next_string_reader(&mut self) -> Result<impl Read + '_, ReaderError>;
+    async fn next_string_reader(&mut self) -> Result<impl AsyncRead + '_, ReaderError>;
 
     /// Consumes and returns a JSON number value
     ///
@@ -1372,9 +1373,9 @@ pub trait JsonReader {
      *       Callers (such as Serde Deserializer number parsing implementation) would then not have to
      *       do this themselves
      */
-    fn next_number<T: FromStr>(&mut self) -> Result<Result<T, T::Err>, ReaderError> {
+    async fn next_number<T: FromStr>(&mut self) -> Result<Result<T, T::Err>, ReaderError> {
         // Default implementation which should be suitable for most JsonReader implementations
-        Ok(T::from_str(self.next_number_as_str()?))
+        Ok(T::from_str(self.next_number_as_str().await?))
     }
 
     /// Consumes and returns the string representation of a JSON number value as `str`
@@ -1418,7 +1419,7 @@ pub trait JsonReader {
     /// when called after the top-level value has already been consumed and multiple top-level
     /// values are not enabled in the [`ReaderSettings`]. Both cases indicate incorrect
     /// usage by the user and are unrelated to the JSON data.
-    fn next_number_as_str(&mut self) -> Result<&str, ReaderError>;
+    async fn next_number_as_str(&mut self) -> Result<&str, ReaderError>;
 
     /// Consumes and returns the string representation of a JSON number value as `String`
     ///
@@ -1428,7 +1429,7 @@ pub trait JsonReader {
     ///
     /// See the documentation of [`next_number_as_str`](Self::next_number_as_str) for
     /// a detailed description of the behavior of reading a number value as string.
-    fn next_number_as_string(&mut self) -> Result<String, ReaderError>;
+    async fn next_number_as_string(&mut self) -> Result<String, ReaderError>;
 
     /// Consumes and returns a JSON boolean value
     ///
@@ -1455,7 +1456,7 @@ pub trait JsonReader {
     /// when called after the top-level value has already been consumed and multiple top-level
     /// values are not enabled in the [`ReaderSettings`]. Both cases indicate incorrect
     /// usage by the user and are unrelated to the JSON data.
-    fn next_bool(&mut self) -> Result<bool, ReaderError>;
+    async fn next_bool(&mut self) -> Result<bool, ReaderError>;
 
     /// Consumes a JSON null value
     ///
@@ -1486,7 +1487,7 @@ pub trait JsonReader {
     /// when called after the top-level value has already been consumed and multiple top-level
     /// values are not enabled in the [`ReaderSettings`]. Both cases indicate incorrect
     /// usage by the user and are unrelated to the JSON data.
-    fn next_null(&mut self) -> Result<(), ReaderError>;
+    async fn next_null(&mut self) -> Result<(), ReaderError>;
 
     /// Deserializes a Serde [`Deserialize`](serde::de::Deserialize) from the next value
     ///
@@ -1548,7 +1549,7 @@ pub trait JsonReader {
     /// values are not enabled in the [`ReaderSettings`]. Both cases indicate incorrect
     /// usage by the user and are unrelated to the JSON data.
     #[cfg(feature = "serde")]
-    fn deserialize_next<'de, D: serde::de::Deserialize<'de>>(
+    async fn deserialize_next<'de, D: serde::de::Deserialize<'de>>(
         &mut self,
     ) -> Result<D, crate::serde::DeserializerError>;
 
@@ -1585,7 +1586,7 @@ pub trait JsonReader {
     /// # Panics
     /// Panics when called on a JSON reader which currently does not expect a member name. This
     /// indicates incorrect usage by the user and is unrelated to the JSON data.
-    fn skip_name(&mut self) -> Result<(), ReaderError>;
+    async fn skip_name(&mut self) -> Result<(), ReaderError>;
 
     /// Skips the next value
     ///
@@ -1628,7 +1629,7 @@ pub trait JsonReader {
     /// has to be used for that), or when called after the top-level value has already been consumed
     /// and multiple top-level values are not enabled in the [`ReaderSettings`]. Both cases indicate
     /// incorrect usage by the user and are unrelated to the JSON data.
-    fn skip_value(&mut self) -> Result<(), ReaderError>;
+    async fn skip_value(&mut self) -> Result<(), ReaderError>;
 
     /// Seeks to the specified location in the JSON document
     ///
@@ -1682,17 +1683,17 @@ pub trait JsonReader {
      * TODO: Rename this method? Name is based on file IO function `seek`, but not sure if "seek to"
      *   is a proper phrase in this context
      */
-    fn seek_to(&mut self, rel_json_path: &JsonPath) -> Result<(), ReaderError> {
+    async fn seek_to(&mut self, rel_json_path: &JsonPath) -> Result<(), ReaderError> {
         // peek here to fail if reader is currently not expecting a value, even if `rel_json_path` is empty
         // and it would otherwise not be detected
-        self.peek()?;
+        self.peek().await?;
 
         for path_piece in rel_json_path {
             match path_piece {
                 JsonPathPiece::ArrayItem(index) => {
-                    self.begin_array()?;
+                    self.begin_array().await?;
                     for i in 0..=*index {
-                        if !self.has_next()? {
+                        if !self.has_next().await? {
                             return Err(ReaderError::UnexpectedStructure {
                                 kind: UnexpectedStructureKind::TooShortArray {
                                     expected_index: *index,
@@ -1703,20 +1704,20 @@ pub trait JsonReader {
 
                         // Last iteration only makes sure has_next() succeeds; don't have to skip value
                         if i < *index {
-                            self.skip_value()?;
+                            self.skip_value().await?;
                         }
                     }
                 }
                 JsonPathPiece::ObjectMember(name) => {
-                    self.begin_object()?;
+                    self.begin_object().await?;
 
                     let mut found_member = false;
-                    while self.has_next()? {
-                        if self.next_name()? == name {
+                    while self.has_next().await? {
+                        if self.next_name().await? == name {
                             found_member = true;
                             break;
                         } else {
-                            self.skip_value()?;
+                            self.skip_value().await?;
                         }
                     }
 
@@ -1789,24 +1790,24 @@ pub trait JsonReader {
     ///
     /// # Panics
     /// Panics may occur if not used according to the correct usage described above.
-    fn seek_back(&mut self, rel_json_path: &JsonPath) -> Result<(), ReaderError> {
+    async fn seek_back(&mut self, rel_json_path: &JsonPath) -> Result<(), ReaderError> {
         // Undo seek piece by piece in reverse order
         for piece in rel_json_path.iter().rev() {
             match piece {
                 JsonPathPiece::ArrayItem(_) => {
                     // Skip remaining items
-                    while self.has_next()? {
-                        self.skip_value()?;
+                    while self.has_next().await? {
+                        self.skip_value().await?;
                     }
-                    self.end_array()?;
+                    self.end_array().await?;
                 }
                 JsonPathPiece::ObjectMember(_) => {
                     // Skip remaining members
-                    while self.has_next()? {
-                        self.skip_name()?;
-                        self.skip_value()?;
+                    while self.has_next().await? {
+                        self.skip_name().await?;
+                        self.skip_value().await?;
                     }
-                    self.end_object()?;
+                    self.end_object().await?;
                 }
             }
         }
@@ -1850,7 +1851,7 @@ pub trait JsonReader {
     ///
     /// # Errors
     /// None, besides [`ReaderError::SyntaxError`] and [`ReaderError::IoError`].
-    fn skip_to_top_level(&mut self) -> Result<(), ReaderError>;
+    async fn skip_to_top_level(&mut self) -> Result<(), ReaderError>;
 
     /// Consumes the next value and writes it to the given JSON writer
     ///
@@ -1920,7 +1921,7 @@ pub trait JsonReader {
      * TODO: Choose a different name which makes it clearer that only the next value is transferred, e.g. `transfer_next_to`?
      * TODO: Are the use cases common enough to justify the existence of this method?
      */
-    fn transfer_to<W: JsonWriter>(&mut self, json_writer: &mut W) -> Result<(), TransferError>;
+    async fn transfer_to<W: JsonWriter>(&mut self, json_writer: &mut W) -> Result<(), TransferError>;
 
     /// Consumes trailing whitespace at the end of the top-level value
     ///
@@ -1962,7 +1963,7 @@ pub trait JsonReader {
     /// called while the top-level value has not been fully consumed yet. Both cases
     /// indicate incorrect usage by the user and are unrelated to the JSON data.
     /* Consumes 'self' */
-    fn consume_trailing_whitespace(self) -> Result<(), ReaderError>;
+    async fn consume_trailing_whitespace(self) -> Result<(), ReaderError>;
 
     /// Gets the current position of this JSON reader within the JSON data
     ///

@@ -6,8 +6,8 @@ use crate::test_lib::{get_expected_events, get_test_data_file_path, JsonEvent};
 
 mod test_lib;
 
-#[test]
-fn writer_test() -> Result<(), Box<dyn Error>> {
+#[futures_test::test]
+async fn writer_test() -> Result<(), Box<dyn Error>> {
     let expected_json = read_to_string(get_test_data_file_path())?;
     // Normalize JSON document string
     let expected_json = expected_json.replace('\r', "");
@@ -25,36 +25,36 @@ fn writer_test() -> Result<(), Box<dyn Error>> {
     for event in get_expected_events() {
         match event {
             JsonEvent::ArrayStart => {
-                json_writer.begin_array()?;
+                json_writer.begin_array().await?;
             }
             JsonEvent::ArrayEnd => {
-                json_writer.end_array()?;
+                json_writer.end_array().await?;
             }
             JsonEvent::ObjectStart => {
-                json_writer.begin_object()?;
+                json_writer.begin_object().await?;
             }
             JsonEvent::ObjectEnd => {
-                json_writer.end_object()?;
+                json_writer.end_object().await?;
             }
             JsonEvent::MemberName(name) => {
-                json_writer.name(&name)?;
+                json_writer.name(&name).await?;
             }
             JsonEvent::StringValue(value) => {
-                json_writer.string_value(&value)?;
+                json_writer.string_value(&value).await?;
             }
             JsonEvent::NumberValue(value) => {
-                json_writer.number_value_from_string(&value)?;
+                json_writer.number_value_from_string(&value).await?;
             }
             JsonEvent::BoolValue(value) => {
-                json_writer.bool_value(value)?;
+                json_writer.bool_value(value).await?;
             }
             JsonEvent::NullValue => {
-                json_writer.null_value()?;
+                json_writer.null_value().await?;
             }
         }
     }
 
-    json_writer.finish_document()?;
+    json_writer.finish_document().await?;
 
     assert_eq!(expected_json, String::from_utf8(writer)?);
 

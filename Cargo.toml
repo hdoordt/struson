@@ -17,6 +17,7 @@ strum = { version = "0.26.1", features = ["derive"] }
 duplicate = "1.0.0"
 
 serde = { version = "1.0.197", optional = true }
+futures = { version = "0.3.30", default-features = false, features = ["std"]}
 
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["html_reports"] }
@@ -29,6 +30,8 @@ serde_json = "1.0.114"
 assert_no_alloc = { git = "https://github.com/Windfisch/rust-assert-no-alloc.git", rev = "d31f2d5f550ce339d1c2f0c1ab7da951224b20df", features = [
     "backtrace",
 ] }
+futures = { version = "0.3.30", default-features = false, features = ["std", "executor"] }
+futures-test = "0.3.30"
 
 [features]
 # Feature for all experimental functionality of Struson which is likely going to change in the future,

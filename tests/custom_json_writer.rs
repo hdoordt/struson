@@ -8,16 +8,17 @@
 //! it is not intended to be used in production code.
 
 use custom_writer::JsonValueWriter;
+use futures::AsyncWriteExt;
 use serde_json::json;
-use std::io::Write;
 use struson::{
     reader::{JsonReader, JsonStreamReader},
     writer::{JsonNumberError, JsonWriter, StringValueWriter},
 };
 
 mod custom_writer {
+    use futures::AsyncWrite;
     use serde_json::{Map, Number, Value};
-    use std::io::{ErrorKind, Write};
+    use std::{fmt::Display, io::ErrorKind};
     use struson::writer::{
         FiniteNumber, FloatingPointNumber, JsonNumberError, JsonWriter, StringValueWriter,
     };
@@ -102,13 +103,13 @@ mod custom_writer {
     }
 
     impl JsonWriter for JsonValueWriter<'_> {
-        fn begin_object(&mut self) -> Result<(), IoError> {
+        async fn begin_object(&mut self) -> Result<(), IoError> {
             self.check_before_value();
             self.stack.push(StackValue::Object(Map::new()));
             Ok(())
         }
 
-        fn end_object(&mut self) -> Result<(), IoError> {
+        async fn end_object(&mut self) -> Result<(), IoError> {
             self.verify_string_writer_inactive();
             if let Some(StackValue::Object(map)) = self.stack.pop() {
                 self.add_value(Value::Object(map));
@@ -118,13 +119,13 @@ mod custom_writer {
             }
         }
 
-        fn begin_array(&mut self) -> Result<(), IoError> {
+        async fn begin_array(&mut self) -> Result<(), IoError> {
             self.check_before_value();
             self.stack.push(StackValue::Array(Vec::new()));
             Ok(())
         }
 
-        fn end_array(&mut self) -> Result<(), IoError> {
+        async fn end_array(&mut self) -> Result<(), IoError> {
             self.verify_string_writer_inactive();
             if let Some(StackValue::Array(vec)) = self.stack.pop() {
                 self.add_value(Value::Array(vec));
@@ -134,7 +135,7 @@ mod custom_writer {
             }
         }
 
-        fn name(&mut self, name: &str) -> Result<(), IoError> {
+        async fn name(&mut self, name: &str) -> Result<(), IoError> {
             self.verify_string_writer_inactive();
             if let Some(StackValue::Object(_)) = self.stack.last() {
                 if self.pending_name.is_some() {
@@ -147,25 +148,27 @@ mod custom_writer {
             }
         }
 
-        fn null_value(&mut self) -> Result<(), IoError> {
+        async fn null_value(&mut self) -> Result<(), IoError> {
             self.check_before_value();
             self.add_value(Value::Null);
             Ok(())
         }
 
-        fn bool_value(&mut self, value: bool) -> Result<(), IoError> {
+        async fn bool_value(&mut self, value: bool) -> Result<(), IoError> {
             self.check_before_value();
             self.add_value(Value::Bool(value));
             Ok(())
         }
 
-        fn string_value(&mut self, value: &str) -> Result<(), IoError> {
+        async fn string_value(&mut self, value: &str) -> Result<(), IoError> {
             self.check_before_value();
             self.add_value(Value::String(value.to_owned()));
             Ok(())
         }
 
-        fn string_value_writer(&mut self) -> Result<impl StringValueWriter + '_, IoError> {
+        async fn string_value_writer(
+            &mut self,
+        ) -> Result<impl StringValueWriter + Unpin + '_, IoError> {
             self.check_before_value();
             self.is_string_value_writer_active = true;
             Ok(StringValueWriterImpl {
@@ -174,7 +177,7 @@ mod custom_writer {
             })
         }
 
-        fn number_value_from_string(&mut self, value: &str) -> Result<(), JsonNumberError> {
+        async fn number_value_from_string(&mut self, value: &str) -> Result<(), JsonNumberError> {
             self.check_before_value();
             // TODO: `parse::<f64>` might not match JSON number string format (might allow more / less than allowed by JSON)?
             let f = value
@@ -184,7 +187,7 @@ mod custom_writer {
             Ok(())
         }
 
-        fn number_value<N: FiniteNumber>(&mut self, value: N) -> Result<(), IoError> {
+        async fn number_value<N: FiniteNumber>(&mut self, value: N) -> Result<(), IoError> {
             let number = value
                 .as_u64()
                 .map(Number::from)
@@ -195,21 +198,20 @@ mod custom_writer {
                 self.add_value(Value::Number(n));
                 Ok(())
             } else {
-                value.use_json_number(|number_str| {
-                    self.number_value_from_string(number_str)
-                        .map_err(|e| match e {
-                            JsonNumberError::InvalidNumber(e) => {
-                                panic!(
-                                    "Unexpected: Writer rejected finite number '{number_str}': {e}"
-                                )
-                            }
-                            JsonNumberError::IoError(e) => IoError::new(ErrorKind::Other, e),
-                        })
-                })
+                let number_str = value.to_string();
+
+                self.number_value_from_string(&number_str)
+                    .await
+                    .map_err(|e| match e {
+                        JsonNumberError::InvalidNumber(e) => {
+                            panic!("Unexpected: Writer rejected finite number '{number_str}': {e}")
+                        }
+                        JsonNumberError::IoError(e) => IoError::new(ErrorKind::Other, e),
+                    })
             }
         }
 
-        fn fp_number_value<N: FloatingPointNumber>(
+        async fn fp_number_value<N: FloatingPointNumber>(
             &mut self,
             value: N,
         ) -> Result<(), JsonNumberError> {
@@ -225,8 +227,11 @@ mod custom_writer {
                 Ok(())
             } else {
                 // TODO: Cannot match over possible implementations? Therefore have to use string representation
-                value.use_json_number(|number_str| {
-                    self.number_value_from_string(number_str).map_err(|e| {
+                let number_str = value.to_string();
+
+                self.number_value_from_string(&number_str)
+                    .await
+                    .map_err(|e| {
                         match e {
                             // `use_json_number` should have verified that value is valid finite JSON number
                             JsonNumberError::InvalidNumber(e) => {
@@ -236,13 +241,13 @@ mod custom_writer {
                             }
                             JsonNumberError::IoError(e) => IoError::new(ErrorKind::Other, e),
                         }
-                    })
-                })
+                    })?;
+                Ok(())
             }
         }
 
         #[cfg(feature = "serde")]
-        fn serialize_value<S: serde::Serialize>(
+        async fn serialize_value<S: serde::Serialize>(
             &mut self,
             value: &S,
         ) -> Result<(), struson::serde::SerializerError> {
@@ -253,7 +258,7 @@ mod custom_writer {
             // might not be necessary because Serde's Serialize API enforces this
         }
 
-        fn finish_document(mut self) -> Result<(), IoError> {
+        async fn finish_document(mut self) -> Result<(), IoError> {
             self.verify_string_writer_inactive();
             if let Some(value) = self.final_value_temp.take() {
                 *self.final_value_holder = Some(value);
@@ -268,19 +273,32 @@ mod custom_writer {
         buf: Vec<u8>,
         json_writer: &'j mut JsonValueWriter<'a>,
     }
-    impl Write for StringValueWriterImpl<'_, '_> {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    impl AsyncWrite for StringValueWriterImpl<'_, '_> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
             self.buf.extend_from_slice(buf);
-            Ok(buf.len())
+            std::task::Poll::Ready(Ok(buf.len()))
         }
 
-        fn flush(&mut self) -> std::io::Result<()> {
-            // No-op
-            Ok(())
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
         }
     }
     impl StringValueWriter for StringValueWriterImpl<'_, '_> {
-        fn finish_value(self) -> Result<(), IoError> {
+        async fn finish_value(self) -> Result<(), IoError> {
             let string =
                 String::from_utf8(self.buf).map_err(|e| IoError::new(ErrorKind::InvalidData, e))?;
             self.json_writer.add_value(Value::String(string));
@@ -290,8 +308,8 @@ mod custom_writer {
     }
 }
 
-#[test]
-fn write() -> Result<(), Box<dyn std::error::Error>> {
+#[futures_test::test]
+async fn write() -> Result<(), Box<dyn std::error::Error>> {
     fn assert_invalid_number(expected_message: Option<&str>, result: Result<(), JsonNumberError>) {
         match result {
             Err(JsonNumberError::InvalidNumber(message)) => {
@@ -306,44 +324,44 @@ fn write() -> Result<(), Box<dyn std::error::Error>> {
     let mut final_value_holder = None;
     let mut json_writer = JsonValueWriter::new(&mut final_value_holder);
 
-    json_writer.begin_array()?;
+    json_writer.begin_array().await?;
 
-    json_writer.begin_object()?;
-    json_writer.name("name1")?;
-    json_writer.begin_array()?;
-    json_writer.bool_value(true)?;
-    json_writer.end_array()?;
-    json_writer.name("name2")?;
-    json_writer.bool_value(false)?;
-    json_writer.end_object()?;
+    json_writer.begin_object().await?;
+    json_writer.name("name1").await?;
+    json_writer.begin_array().await?;
+    json_writer.bool_value(true).await?;
+    json_writer.end_array().await?;
+    json_writer.name("name2").await?;
+    json_writer.bool_value(false).await?;
+    json_writer.end_object().await?;
 
-    json_writer.null_value()?;
-    json_writer.bool_value(true)?;
-    json_writer.bool_value(false)?;
-    json_writer.string_value("string")?;
+    json_writer.null_value().await?;
+    json_writer.bool_value(true).await?;
+    json_writer.bool_value(false).await?;
+    json_writer.string_value("string").await?;
 
-    let mut string_writer = json_writer.string_value_writer()?;
-    string_writer.write_all("first ".as_bytes())?;
-    string_writer.write_all("second".as_bytes())?;
-    string_writer.finish_value()?;
+    let mut string_writer = json_writer.string_value_writer().await?;
+    string_writer.write_all("first ".as_bytes()).await?;
+    string_writer.write_all("second".as_bytes()).await?;
+    string_writer.finish_value().await?;
 
-    json_writer.number_value_from_string("123")?;
+    json_writer.number_value_from_string("123").await?;
     assert_invalid_number(
         Some(&format!("non-finite number: {}", f64::INFINITY)),
-        json_writer.number_value_from_string("Infinity"),
+        json_writer.number_value_from_string("Infinity").await,
     );
     // Don't check for exact error message because it is created by Rust and might change in the future
-    assert_invalid_number(None, json_writer.number_value_from_string("test"));
-    json_writer.number_value(45)?;
-    json_writer.number_value(-67)?;
-    json_writer.fp_number_value(8.9)?;
+    assert_invalid_number(None, json_writer.number_value_from_string("test").await);
+    json_writer.number_value(45).await?;
+    json_writer.number_value(-67).await?;
+    json_writer.fp_number_value(8.9).await?;
     assert_invalid_number(
         Some(&format!("non-finite number: {}", f64::INFINITY)),
-        json_writer.fp_number_value(f64::INFINITY),
+        json_writer.fp_number_value(f64::INFINITY).await,
     );
 
-    json_writer.end_array()?;
-    json_writer.finish_document()?;
+    json_writer.end_array().await?;
+    json_writer.finish_document().await?;
 
     let expected_json = json!([
         {
@@ -366,18 +384,18 @@ fn write() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[test]
-fn transfer() -> Result<(), Box<dyn std::error::Error>> {
+#[futures_test::test]
+async fn transfer() -> Result<(), Box<dyn std::error::Error>> {
     let mut final_value_holder = None;
     let mut json_writer = JsonValueWriter::new(&mut final_value_holder);
 
     let mut json_reader = JsonStreamReader::new(
         "[true, 123, {\"name1\": \"value1\", \"name2\": null}, false]".as_bytes(),
     );
-    json_reader.transfer_to(&mut json_writer)?;
-    json_reader.consume_trailing_whitespace()?;
+    json_reader.transfer_to(&mut json_writer).await?;
+    json_reader.consume_trailing_whitespace().await?;
 
-    json_writer.finish_document()?;
+    json_writer.finish_document().await?;
 
     let expected_json = json!([
         true,
@@ -395,8 +413,8 @@ fn transfer() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(feature = "serde")]
-#[test]
-fn serialize() -> Result<(), Box<dyn std::error::Error>> {
+#[futures_test::test]
+async fn serialize() -> Result<(), Box<dyn std::error::Error>> {
     use serde::Serialize;
 
     #[derive(Serialize)]

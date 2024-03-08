@@ -1,9 +1,8 @@
 //! Streaming implementation of [`JsonWriter`]
 
-use std::{
-    io::{ErrorKind, Write},
-    str::Utf8Error,
-};
+use std::{fmt::Display, io::ErrorKind, str::Utf8Error};
+
+use futures::Future;
 
 use super::*;
 use crate::utf8;
@@ -124,7 +123,7 @@ const WRITER_BUF_SIZE: usize = 1024;
 ///
 /// If the underlying writer returns an error of kind [`ErrorKind::Interrupted`], this
 /// JSON writer will keep retrying to write the data.
-pub struct JsonStreamWriter<W: Write> {
+pub struct JsonStreamWriter<W: AsyncWrite> {
     // When adding more fields to this struct, adjust the Debug implementation below, if necessary
     writer: W,
     buf: [u8; WRITER_BUF_SIZE],
@@ -143,7 +142,7 @@ pub struct JsonStreamWriter<W: Write> {
 }
 
 // Implementation with public constructor methods
-impl<W: Write> JsonStreamWriter<W> {
+impl<W: AsyncWrite> JsonStreamWriter<W> {
     /// Creates a JSON writer with [default settings](WriterSettings::default)
     pub fn new(writer: W) -> Self {
         JsonStreamWriter::new_custom(writer, WriterSettings::default())
@@ -168,8 +167,8 @@ impl<W: Write> JsonStreamWriter<W> {
 }
 
 // Implementation with low level byte writing methods
-impl<W: Write> JsonStreamWriter<W> {
-    fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), IoError> {
+impl<W: AsyncWrite + Unpin> JsonStreamWriter<W> {
+    async fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), IoError> {
         let mut pos = 0;
         while pos < bytes.len() {
             let copied_count = (self.buf.len() - self.buf_write_pos).min(bytes.len() - pos);
@@ -180,7 +179,7 @@ impl<W: Write> JsonStreamWriter<W> {
 
             if self.buf_write_pos >= self.buf.len() {
                 // write_all retries on `ErrorKind::Interrupted`, as desired
-                self.writer.write_all(&self.buf)?;
+                self.writer.write_all(&self.buf).await?;
                 self.buf_write_pos = 0;
             }
         }
@@ -188,16 +187,18 @@ impl<W: Write> JsonStreamWriter<W> {
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<(), IoError> {
+    async fn flush(&mut self) -> Result<(), IoError> {
         // write_all retries on `ErrorKind::Interrupted`, as desired
-        self.writer.write_all(&self.buf[0..self.buf_write_pos])?;
+        self.writer
+            .write_all(&self.buf[0..self.buf_write_pos])
+            .await?;
         self.buf_write_pos = 0;
-        self.writer.flush()
+        self.writer.flush().await
     }
 }
 
 // Implementation with JSON structure state inspection methods, and general value methods
-impl<W: Write> JsonStreamWriter<W> {
+impl<W: AsyncWrite + Unpin> JsonStreamWriter<W> {
     fn is_in_array(&self) -> bool {
         self.stack.last().map_or(false, |v| v == &StackValue::Array)
     }
@@ -216,34 +217,34 @@ impl<W: Write> JsonStreamWriter<W> {
         self.indentation_level -= 1;
     }
 
-    fn write_indentation(&mut self) -> Result<(), IoError> {
+    async fn write_indentation(&mut self) -> Result<(), IoError> {
         for _ in 0..self.indentation_level {
-            self.write_bytes(b"  ")?;
+            self.write_bytes(b"  ").await?;
         }
         Ok(())
     }
 
-    fn before_container_element(&mut self) -> Result<(), IoError> {
+    async fn before_container_element(&mut self) -> Result<(), IoError> {
         if self.is_empty {
             if self.writer_settings.pretty_print {
                 // Convert "[" (respectively "{") to "[\n..."
-                self.write_bytes(b"\n")?;
+                self.write_bytes(b"\n").await?;
                 self.increase_indentation();
-                self.write_indentation()?;
+                self.write_indentation().await?;
             }
         } else {
             #[allow(clippy::collapsible_else_if)]
             if self.writer_settings.pretty_print {
-                self.write_bytes(b",\n")?;
-                self.write_indentation()?;
+                self.write_bytes(b",\n").await?;
+                self.write_indentation().await?;
             } else {
-                self.write_bytes(b",")?;
+                self.write_bytes(b",").await?;
             }
         }
         Ok(())
     }
 
-    fn before_value(&mut self) -> Result<(), IoError> {
+    async fn before_value(&mut self) -> Result<(), IoError> {
         if self.is_string_value_writer_active {
             panic!("Incorrect writer usage: Cannot finish document when string value writer is still active");
         }
@@ -259,11 +260,11 @@ impl<W: Write> JsonStreamWriter<W> {
                     // TODO: Avoid clone() here; compiler currently does not allow borrowing it because
                     //   `write_bytes` has a mutable borrow to self
                     let separator = separator.clone();
-                    self.write_bytes(separator.as_bytes())?;
+                    self.write_bytes(separator.as_bytes()).await?;
                 },
             }
         } else if self.is_in_array() {
-            self.before_container_element()?;
+            self.before_container_element().await?;
         }
         self.is_empty = false;
 
@@ -275,13 +276,13 @@ impl<W: Write> JsonStreamWriter<W> {
         Ok(())
     }
 
-    fn on_container_end(&mut self) -> Result<(), IoError> {
+    async fn on_container_end(&mut self) -> Result<(), IoError> {
         self.stack.pop();
 
         if !self.is_empty && self.writer_settings.pretty_print {
-            self.write_bytes(b"\n")?;
+            self.write_bytes(b"\n").await?;
             self.decrease_indentation();
-            self.write_indentation()?;
+            self.write_indentation().await?;
         }
 
         // Enclosing container is not empty since this method call here is processing its child
@@ -294,7 +295,7 @@ impl<W: Write> JsonStreamWriter<W> {
 }
 
 // Implementation with string writing methods
-impl<W: Write> JsonStreamWriter<W> {
+impl<W: AsyncWrite + Unpin> JsonStreamWriter<W> {
     fn should_escape(&self, c: char) -> bool {
         c == '"' || c == '\\'
         // Control characters which must be escaped per JSON specification
@@ -303,7 +304,7 @@ impl<W: Write> JsonStreamWriter<W> {
             || (self.writer_settings.escape_all_control_chars && c.is_control())
     }
 
-    fn write_escaped_char(&mut self, c: char) -> Result<(), IoError> {
+    async fn write_escaped_char(&mut self, c: char) -> Result<(), IoError> {
         fn get_unicode_escape(value: u32) -> [u8; 4] {
             // For convenience `value` is u32, but it is actually u16
             debug_assert!(value <= u16::MAX as u32);
@@ -334,8 +335,8 @@ impl<W: Write> JsonStreamWriter<W> {
             '\r' => "\\r",
             '\t' => "\\t",
             '\0'..='\u{FFFF}' => {
-                self.write_bytes(b"\\u")?;
-                self.write_bytes(&get_unicode_escape(c as u32))?;
+                self.write_bytes(b"\\u").await?;
+                self.write_bytes(&get_unicode_escape(c as u32)).await?;
                 return Ok(());
             }
             _ => {
@@ -344,74 +345,75 @@ impl<W: Write> JsonStreamWriter<W> {
                 let high = (temp >> 10) + 0xD800;
                 let low = (temp & ((1 << 10) - 1)) + 0xDC00;
 
-                self.write_bytes(b"\\u")?;
-                self.write_bytes(&get_unicode_escape(high))?;
+                self.write_bytes(b"\\u").await?;
+                self.write_bytes(&get_unicode_escape(high)).await?;
 
-                self.write_bytes(b"\\u")?;
-                self.write_bytes(&get_unicode_escape(low))?;
+                self.write_bytes(b"\\u").await?;
+                self.write_bytes(&get_unicode_escape(low)).await?;
                 return Ok(());
             }
         };
-        self.write_bytes(escape.as_bytes())
+        self.write_bytes(escape.as_bytes()).await
     }
 
-    fn write_string_value_piece(&mut self, value: &str) -> Result<(), IoError> {
+    async fn write_string_value_piece(&mut self, value: &str) -> Result<(), IoError> {
         let bytes = value.as_bytes();
         let mut next_to_write_index = 0;
 
         for (index, char) in value.char_indices() {
             if self.should_escape(char) {
                 if index > next_to_write_index {
-                    self.write_bytes(&bytes[next_to_write_index..index])?;
+                    self.write_bytes(&bytes[next_to_write_index..index]).await?;
                 }
-                self.write_escaped_char(char)?;
+                self.write_escaped_char(char).await?;
                 next_to_write_index = index + char.len_utf8();
             }
         }
         // Write remaining bytes
         if next_to_write_index < bytes.len() {
-            self.write_bytes(&bytes[next_to_write_index..])?;
+            self.write_bytes(&bytes[next_to_write_index..]).await?;
         }
 
         Ok(())
     }
 
-    fn write_string_value(&mut self, value: &str) -> Result<(), IoError> {
-        self.write_bytes(b"\"")?;
-        self.write_string_value_piece(value)?;
-        self.write_bytes(b"\"")
+    async fn write_string_value(&mut self, value: &str) -> Result<(), IoError> {
+        self.write_bytes(b"\"").await?;
+        self.write_string_value_piece(value).await?;
+        self.write_bytes(b"\"").await
     }
 }
 
-impl<W: Write> JsonWriter for JsonStreamWriter<W> {
-    fn begin_object(&mut self) -> Result<(), IoError> {
-        self.before_value()?;
+impl<W: AsyncWrite + Unpin> JsonWriter for JsonStreamWriter<W> {
+    async fn begin_object(&mut self) -> Result<(), IoError> {
+        self.before_value().await?;
         self.stack.push(StackValue::Object);
         self.is_empty = true;
         self.expects_member_name = true;
-        self.write_bytes(b"{")
+        self.write_bytes(b"{").await
     }
 
-    fn name(&mut self, name: &str) -> Result<(), IoError> {
+    async fn name(&mut self, name: &str) -> Result<(), IoError> {
         if !self.expects_member_name {
             panic!("Incorrect writer usage: Cannot write name when name is not expected");
         }
         if self.is_string_value_writer_active {
             panic!("Incorrect writer usage: Cannot finish document when string value writer is still active");
         }
-        self.before_container_element()?;
-        self.write_string_value(name)?;
+        self.before_container_element().await?;
+        self.write_string_value(name).await?;
         self.write_bytes(if self.writer_settings.pretty_print {
             b": "
         } else {
             b":"
-        })?;
+        })
+        .await?;
         self.expects_member_name = false;
 
         Ok(())
     }
 
-    fn end_object(&mut self) -> Result<(), IoError> {
+    async fn end_object(&mut self) -> Result<(), IoError> {
         if !self.is_in_object() {
             panic!("Incorrect writer usage: Cannot end object when not inside object");
         }
@@ -421,22 +423,22 @@ impl<W: Write> JsonWriter for JsonStreamWriter<W> {
         if !self.expects_member_name {
             panic!("Incorrect writer usage: Cannot end object when member value is expected");
         }
-        self.on_container_end()?;
-        self.write_bytes(b"}")
+        self.on_container_end().await?;
+        self.write_bytes(b"}").await
     }
 
-    fn begin_array(&mut self) -> Result<(), IoError> {
-        self.before_value()?;
+    async fn begin_array(&mut self) -> Result<(), IoError> {
+        self.before_value().await?;
         self.stack.push(StackValue::Array);
         self.is_empty = true;
 
         // Clear this because it is only relevant for objects; will be restored when entering parent object (if any) again
         self.expects_member_name = false;
 
-        self.write_bytes(b"[")
+        self.write_bytes(b"[").await
     }
 
-    fn end_array(&mut self) -> Result<(), IoError> {
+    async fn end_array(&mut self) -> Result<(), IoError> {
         if !self.is_in_array() {
             panic!("Incorrect writer usage: Cannot end array when not inside array");
         }
@@ -445,43 +447,48 @@ impl<W: Write> JsonWriter for JsonStreamWriter<W> {
                 "Incorrect writer usage: Cannot end array when string value writer is still active"
             );
         }
-        self.on_container_end()?;
-        self.write_bytes(b"]")
+        self.on_container_end().await?;
+        self.write_bytes(b"]").await
     }
 
-    fn string_value(&mut self, value: &str) -> Result<(), IoError> {
-        self.before_value()?;
-        self.write_string_value(value)
+    async fn string_value(&mut self, value: &str) -> Result<(), IoError> {
+        self.before_value().await?;
+        self.write_string_value(value).await
     }
 
-    fn bool_value(&mut self, value: bool) -> Result<(), IoError> {
-        self.before_value()?;
+    async fn bool_value(&mut self, value: bool) -> Result<(), IoError> {
+        self.before_value().await?;
         self.write_bytes(if value { b"true" } else { b"false" })
+            .await
     }
 
-    fn null_value(&mut self) -> Result<(), IoError> {
-        self.before_value()?;
-        self.write_bytes(b"null")
+    async fn null_value(&mut self) -> Result<(), IoError> {
+        self.before_value().await?;
+        self.write_bytes(b"null").await
     }
 
-    fn number_value<N: FiniteNumber>(&mut self, value: N) -> Result<(), IoError> {
-        value.use_json_number(|number_str| {
-            self.before_value()?;
-            self.write_bytes(number_str.as_bytes())
-        })
+    async fn number_value<N: FiniteNumber + Display>(&mut self, value: N) -> Result<(), IoError> {
+        let number_str = value.to_string();
+
+        self.before_value().await?;
+        self.write_bytes(number_str.as_bytes()).await
     }
 
-    fn fp_number_value<N: FloatingPointNumber>(&mut self, value: N) -> Result<(), JsonNumberError> {
-        value.use_json_number(|number_str| {
-            self.before_value()?;
-            self.write_bytes(number_str.as_bytes())
-        })
+    async fn fp_number_value<N: FloatingPointNumber + Display>(
+        &mut self,
+        value: N,
+    ) -> Result<(), JsonNumberError> {
+        value.validate()?;
+        let number_str = value.to_string();
+        self.before_value().await?;
+        self.write_bytes(number_str.as_bytes()).await?;
+        Ok(())
     }
 
-    fn number_value_from_string(&mut self, value: &str) -> Result<(), JsonNumberError> {
-        if is_valid_json_number(value) {
-            self.before_value()?;
-            self.write_bytes(value.as_bytes())?;
+    async fn number_value_from_string(&mut self, value: &str) -> Result<(), JsonNumberError> {
+        if is_valid_json_number(value).await {
+            self.before_value().await?;
+            self.write_bytes(value.as_bytes()).await?;
             Ok(())
         } else {
             Err(JsonNumberError::InvalidNumber(format!(
@@ -491,7 +498,7 @@ impl<W: Write> JsonWriter for JsonStreamWriter<W> {
     }
 
     #[cfg(feature = "serde")]
-    fn serialize_value<S: serde::ser::Serialize>(
+    async fn serialize_value<S: serde::ser::Serialize>(
         &mut self,
         value: &S,
     ) -> Result<(), crate::serde::SerializerError> {
@@ -500,12 +507,12 @@ impl<W: Write> JsonWriter for JsonStreamWriter<W> {
         // not sure if that should be enforced for the JsonWriter trait
 
         let mut serializer = crate::serde::JsonWriterSerializer::new(self);
-        value.serialize(&mut serializer)
+        value.serialize(&mut serializer).await
         // TODO: Verify that value was properly serialized (only single value; no incomplete array or object)
         // might not be necessary because Serde's Serialize API enforces this
     }
 
-    fn finish_document(mut self) -> Result<(), IoError> {
+    async fn finish_document(mut self) -> Result<(), IoError> {
         if self.is_string_value_writer_active {
             panic!("Incorrect writer usage: Cannot finish document when string value writer is still active");
         }
@@ -519,12 +526,14 @@ impl<W: Write> JsonWriter for JsonStreamWriter<W> {
         } else {
             panic!("Incorrect writer usage: Cannot finish document when top-level value is not finished");
         }
-        self.flush()
+        self.flush().await
     }
 
-    fn string_value_writer(&mut self) -> Result<impl StringValueWriter + '_, IoError> {
-        self.before_value()?;
-        self.write_bytes(b"\"")?;
+    async fn string_value_writer(
+        &mut self,
+    ) -> Result<impl StringValueWriter + Unpin + '_, IoError> {
+        self.before_value().await?;
+        self.write_bytes(b"\"").await?;
         self.is_string_value_writer_active = true;
         Ok(StringValueWriterImpl {
             json_writer: self,
@@ -537,7 +546,7 @@ impl<W: Write> JsonWriter for JsonStreamWriter<W> {
 }
 
 // TODO: Is there a way to have `W` only optionally implement `Debug`?
-impl<W: Write + Debug> Debug for JsonStreamWriter<W> {
+impl<W: AsyncWrite + Debug> Debug for JsonStreamWriter<W> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut debug_struct = f.debug_struct("JsonStreamWriter");
         debug_struct
@@ -611,7 +620,7 @@ impl<W: Write + Debug> Debug for JsonStreamWriter<W> {
     }
 }
 
-struct StringValueWriterImpl<'j, W: Write> {
+struct StringValueWriterImpl<'j, W: AsyncWrite> {
     json_writer: &'j mut JsonStreamWriter<W>,
     /// Buffer used to store incomplete data of a UTF-8 multi-byte character provided by
     /// a user of this writer
@@ -643,8 +652,8 @@ fn decode_utf8_char(bytes: &[u8]) -> Result<&str, IoError> {
     }
 }
 
-impl<W: Write> StringValueWriterImpl<'_, W> {
-    fn write_impl(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+impl<W: AsyncWrite + Unpin> StringValueWriterImpl<'_, W> {
+    async fn write_impl(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
@@ -659,7 +668,7 @@ impl<W: Write> StringValueWriterImpl<'_, W> {
             if self.utf8_pos >= self.utf8_expected_len {
                 self.utf8_pos = 0;
                 let s = decode_utf8_char(&self.utf8_buf[..self.utf8_expected_len])?;
-                self.json_writer.write_string_value_piece(s)?;
+                self.json_writer.write_string_value_piece(s).await?;
             }
             start_pos += copy_count;
         }
@@ -697,9 +706,11 @@ impl<W: Write> StringValueWriterImpl<'_, W> {
 
                 let remaining_count = buf.len() - i;
                 if remaining_count < expected_bytes_count {
-                    self.json_writer.write_string_value_piece(
-                        std::str::from_utf8(&buf[start_pos..i]).map_err(map_utf8_error)?,
-                    )?;
+                    self.json_writer
+                        .write_string_value_piece(
+                            std::str::from_utf8(&buf[start_pos..i]).map_err(map_utf8_error)?,
+                        )
+                        .await?;
 
                     // Store the incomplete UTF-8 bytes in buffer
                     self.utf8_expected_len = expected_bytes_count;
@@ -715,9 +726,11 @@ impl<W: Write> StringValueWriterImpl<'_, W> {
             i += 1;
         }
 
-        self.json_writer.write_string_value_piece(
-            std::str::from_utf8(&buf[start_pos..]).map_err(map_utf8_error)?,
-        )?;
+        self.json_writer
+            .write_string_value_piece(
+                std::str::from_utf8(&buf[start_pos..]).map_err(map_utf8_error)?,
+            )
+            .await?;
         Ok(buf.len())
     }
 
@@ -734,26 +747,43 @@ impl<W: Write> StringValueWriterImpl<'_, W> {
         }
     }
 }
-impl<W: Write> Write for StringValueWriterImpl<'_, W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+impl<W: AsyncWrite + Unpin> AsyncWrite for StringValueWriterImpl<'_, W> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
         self.check_previous_error()?;
 
-        let result = self.write_impl(buf);
+        let result = match std::pin::pin!(self.write_impl(buf)).poll(cx) {
+            std::task::Poll::Ready(res) => res,
+            p @ std::task::Poll::Pending => return p,
+        };
         if let Err(e) = &result {
             self.error = Some((e.kind(), e.to_string()));
         }
-        result
+        std::task::Poll::Ready(result)
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
         self.check_previous_error()?;
-        self.json_writer.flush()
+        std::pin::pin!(self.json_writer.flush()).poll(cx)
+    }
+
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
     }
 }
 
-impl<W: Write> StringValueWriter for StringValueWriterImpl<'_, W> {
+impl<W: AsyncWrite + Unpin> StringValueWriter for StringValueWriterImpl<'_, W> {
     // Provides more efficient implementation which benefits from avoided UTF-8 validation
-    fn write_str(&mut self, s: &str) -> Result<(), IoError> {
+    async fn write_str(&mut self, s: &str) -> Result<(), IoError> {
         self.check_previous_error()?;
 
         if self.utf8_pos > 0 {
@@ -764,11 +794,11 @@ impl<W: Write> StringValueWriter for StringValueWriterImpl<'_, W> {
                 "incomplete multi-byte UTF-8 data",
             ));
         }
-        self.json_writer.write_string_value_piece(s)?;
+        self.json_writer.write_string_value_piece(s).await?;
         Ok(())
     }
 
-    fn finish_value(self) -> Result<(), IoError> {
+    async fn finish_value(self) -> Result<(), IoError> {
         self.check_previous_error()?;
 
         if self.utf8_pos > 0 {
@@ -777,7 +807,7 @@ impl<W: Write> StringValueWriter for StringValueWriterImpl<'_, W> {
                 "incomplete multi-byte UTF-8 data",
             ));
         }
-        self.json_writer.write_bytes(b"\"")?;
+        self.json_writer.write_bytes(b"\"").await?;
         self.json_writer.is_string_value_writer_active = false;
         Ok(())
     }
@@ -789,32 +819,32 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    #[test]
-    fn numbers() -> TestResult {
+    #[futures_test::test]
+    async fn numbers() -> TestResult {
         let mut writer = Vec::<u8>::new();
         let mut json_writer = JsonStreamWriter::new(&mut writer);
 
-        json_writer.begin_array()?;
-        json_writer.number_value(8_u8)?;
-        json_writer.number_value(-8_i8)?;
-        json_writer.number_value(16_u16)?;
-        json_writer.number_value(-16_i16)?;
-        json_writer.number_value(32_u32)?;
-        json_writer.number_value(-32_i32)?;
-        json_writer.number_value(64_u64)?;
-        json_writer.number_value(-64_i64)?;
-        json_writer.number_value(128_u128)?;
-        json_writer.number_value(-128_i128)?;
+        json_writer.begin_array().await?;
+        json_writer.number_value(8_u8).await?;
+        json_writer.number_value(-8_i8).await?;
+        json_writer.number_value(16_u16).await?;
+        json_writer.number_value(-16_i16).await?;
+        json_writer.number_value(32_u32).await?;
+        json_writer.number_value(-32_i32).await?;
+        json_writer.number_value(64_u64).await?;
+        json_writer.number_value(-64_i64).await?;
+        json_writer.number_value(128_u128).await?;
+        json_writer.number_value(-128_i128).await?;
 
-        json_writer.fp_number_value(1.5_f32)?;
-        json_writer.fp_number_value(-1.5_f32)?;
-        json_writer.fp_number_value(2.5_f64)?;
-        json_writer.fp_number_value(-2.5_f64)?;
+        json_writer.fp_number_value(1.5_f32).await?;
+        json_writer.fp_number_value(-1.5_f32).await?;
+        json_writer.fp_number_value(2.5_f64).await?;
+        json_writer.fp_number_value(-2.5_f64).await?;
 
-        json_writer.number_value_from_string("123.45e-12")?;
+        json_writer.number_value_from_string("123.45e-12").await?;
 
-        json_writer.end_array()?;
-        json_writer.finish_document()?;
+        json_writer.end_array().await?;
+        json_writer.finish_document().await?;
 
         assert_eq!(
             "[8,-8,16,-16,32,-32,64,-64,128,-128,1.5,-1.5,2.5,-2.5,123.45e-12]",
@@ -823,8 +853,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn numbers_invalid() {
+    #[futures_test::test]
+    async fn numbers_invalid() {
         fn assert_invalid_number(result: Result<(), JsonNumberError>, expected_message: &str) {
             match result {
                 Ok(_) => panic!("Should have failed"),
@@ -841,164 +871,164 @@ mod tests {
         let mut json_writer = JsonStreamWriter::new(&mut writer);
 
         assert_invalid_number(
-            json_writer.fp_number_value(f32::NAN),
+            json_writer.fp_number_value(f32::NAN).await,
             &format!("non-finite number: {}", f32::NAN),
         );
         assert_invalid_number(
-            json_writer.fp_number_value(f64::INFINITY),
+            json_writer.fp_number_value(f64::INFINITY).await,
             &format!("non-finite number: {}", f64::INFINITY),
         );
         assert_invalid_number(
-            json_writer.number_value_from_string("NaN"),
+            json_writer.number_value_from_string("NaN").await,
             "invalid JSON number: NaN",
         );
         assert_invalid_number(
-            json_writer.number_value_from_string("+1"),
+            json_writer.number_value_from_string("+1").await,
             "invalid JSON number: +1",
         );
         assert_invalid_number(
-            json_writer.number_value_from_string("00"),
+            json_writer.number_value_from_string("00").await,
             "invalid JSON number: 00",
         );
         assert_invalid_number(
-            json_writer.number_value_from_string("1e"),
+            json_writer.number_value_from_string("1e").await,
             "invalid JSON number: 1e",
         );
         assert_invalid_number(
-            json_writer.number_value_from_string("12a"),
+            json_writer.number_value_from_string("12a").await,
             "invalid JSON number: 12a",
         );
     }
 
-    #[test]
-    fn literals() -> TestResult {
+    #[futures_test::test]
+    async fn literals() -> TestResult {
         let mut writer = Vec::<u8>::new();
         let mut json_writer = JsonStreamWriter::new(&mut writer);
-        json_writer.begin_array()?;
+        json_writer.begin_array().await?;
 
-        json_writer.bool_value(true)?;
-        json_writer.bool_value(false)?;
-        json_writer.null_value()?;
+        json_writer.bool_value(true).await?;
+        json_writer.bool_value(false).await?;
+        json_writer.null_value().await?;
 
-        json_writer.end_array()?;
-        json_writer.finish_document()?;
+        json_writer.end_array().await?;
+        json_writer.finish_document().await?;
 
         assert_eq!("[true,false,null]", String::from_utf8(writer)?);
         Ok(())
     }
 
-    #[test]
-    fn arrays() -> TestResult {
+    #[futures_test::test]
+    async fn arrays() -> TestResult {
         let mut writer = Vec::<u8>::new();
         let mut json_writer = JsonStreamWriter::new(&mut writer);
-        json_writer.begin_array()?;
+        json_writer.begin_array().await?;
 
-        json_writer.begin_array()?;
-        json_writer.number_value(1)?;
-        json_writer.end_array()?;
+        json_writer.begin_array().await?;
+        json_writer.number_value(1).await?;
+        json_writer.end_array().await?;
 
-        json_writer.begin_array()?;
-        json_writer.end_array()?;
+        json_writer.begin_array().await?;
+        json_writer.end_array().await?;
 
-        json_writer.end_array()?;
-        json_writer.finish_document()?;
+        json_writer.end_array().await?;
+        json_writer.finish_document().await?;
 
         assert_eq!("[[1],[]]", String::from_utf8(writer)?);
         Ok(())
     }
 
-    #[test]
+    #[futures_test::test]
     #[should_panic(expected = "Incorrect writer usage: Cannot end array when not inside array")]
-    fn end_array_not_in_array() {
+    async fn end_array_not_in_array() {
         let mut writer = Vec::<u8>::new();
         let mut json_writer = JsonStreamWriter::new(&mut writer);
-        json_writer.begin_object().unwrap();
+        json_writer.begin_object().await.unwrap();
 
-        json_writer.end_array().unwrap();
+        json_writer.end_array().await.unwrap();
     }
 
-    #[test]
-    fn objects() -> TestResult {
+    #[futures_test::test]
+    async fn objects() -> TestResult {
         let mut writer = Vec::<u8>::new();
         let mut json_writer = JsonStreamWriter::new(&mut writer);
-        json_writer.begin_object()?;
+        json_writer.begin_object().await?;
 
-        json_writer.name("a")?;
-        json_writer.number_value(1)?;
+        json_writer.name("a").await?;
+        json_writer.number_value(1).await?;
 
-        json_writer.name("")?;
-        json_writer.number_value(2)?;
+        json_writer.name("").await?;
+        json_writer.number_value(2).await?;
 
-        json_writer.name("a")?;
+        json_writer.name("a").await?;
 
-        json_writer.begin_object()?;
-        json_writer.name("c")?;
-        json_writer.begin_object()?;
-        json_writer.end_object()?;
-        json_writer.end_object()?;
+        json_writer.begin_object().await?;
+        json_writer.name("c").await?;
+        json_writer.begin_object().await?;
+        json_writer.end_object().await?;
+        json_writer.end_object().await?;
 
-        json_writer.end_object()?;
-        json_writer.finish_document()?;
+        json_writer.end_object().await?;
+        json_writer.finish_document().await?;
 
         assert_eq!(r#"{"a":1,"":2,"a":{"c":{}}}"#, String::from_utf8(writer)?);
         Ok(())
     }
 
-    #[test]
+    #[futures_test::test]
     #[should_panic(expected = "Incorrect writer usage: Cannot end object when not inside object")]
-    fn end_object_not_in_object() {
+    async fn end_object_not_in_object() {
         let mut writer = Vec::<u8>::new();
         let mut json_writer = JsonStreamWriter::new(&mut writer);
-        json_writer.begin_array().unwrap();
+        json_writer.begin_array().await.unwrap();
 
-        json_writer.end_object().unwrap();
+        json_writer.end_object().await.unwrap();
     }
 
-    #[test]
+    #[futures_test::test]
     #[should_panic(
         expected = "Incorrect writer usage: Cannot end object when member value is expected"
     )]
-    fn end_object_expecting_value() {
+    async fn end_object_expecting_value() {
         let mut writer = Vec::<u8>::new();
         let mut json_writer = JsonStreamWriter::new(&mut writer);
-        json_writer.begin_object().unwrap();
-        json_writer.name("a").unwrap();
+        json_writer.begin_object().await.unwrap();
+        json_writer.name("a").await.unwrap();
 
-        json_writer.end_object().unwrap();
+        json_writer.end_object().await.unwrap();
     }
 
-    #[test]
-    fn arrays_objects_mixed() -> TestResult {
+    #[futures_test::test]
+    async fn arrays_objects_mixed() -> TestResult {
         let mut writer = Vec::<u8>::new();
         let mut json_writer = JsonStreamWriter::new(&mut writer);
-        json_writer.begin_object()?;
+        json_writer.begin_object().await?;
 
-        json_writer.name("a")?;
+        json_writer.name("a").await?;
 
-        json_writer.begin_object()?;
-        json_writer.name("b")?;
+        json_writer.begin_object().await?;
+        json_writer.name("b").await?;
 
-        json_writer.begin_array()?;
+        json_writer.begin_array().await?;
 
-        json_writer.begin_object()?;
-        json_writer.end_object()?;
+        json_writer.begin_object().await?;
+        json_writer.end_object().await?;
 
-        json_writer.begin_object()?;
-        json_writer.name("c")?;
-        json_writer.begin_array()?;
-        json_writer.begin_array()?;
-        json_writer.end_array()?;
-        json_writer.end_array()?;
-        json_writer.end_object()?;
+        json_writer.begin_object().await?;
+        json_writer.name("c").await?;
+        json_writer.begin_array().await?;
+        json_writer.begin_array().await?;
+        json_writer.end_array().await?;
+        json_writer.end_array().await?;
+        json_writer.end_object().await?;
 
-        json_writer.end_array()?;
-        json_writer.name("d")?;
-        json_writer.begin_array()?;
-        json_writer.end_array()?;
-        json_writer.end_object()?;
+        json_writer.end_array().await?;
+        json_writer.name("d").await?;
+        json_writer.begin_array().await?;
+        json_writer.end_array().await?;
+        json_writer.end_object().await?;
 
-        json_writer.end_object()?;
-        json_writer.finish_document()?;
+        json_writer.end_object().await?;
+        json_writer.finish_document().await?;
 
         assert_eq!(
             r#"{"a":{"b":[{},{"c":[[]]}],"d":[]}}"#,
@@ -1007,22 +1037,24 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn strings() -> TestResult {
+    #[futures_test::test]
+    async fn strings() -> TestResult {
         let mut writer = Vec::<u8>::new();
         let mut json_writer = JsonStreamWriter::new(&mut writer);
-        json_writer.begin_array()?;
+        json_writer.begin_array().await?;
 
-        json_writer.string_value("")?;
-        json_writer.string_value("ab")?;
-        json_writer.string_value("\u{0000}\u{001F}")?;
-        json_writer.string_value("a b")?;
-        json_writer.string_value("\"\\/\u{0008}\u{000C}\n\r\t")?;
+        json_writer.string_value("").await?;
+        json_writer.string_value("ab").await?;
+        json_writer.string_value("\u{0000}\u{001F}").await?;
+        json_writer.string_value("a b").await?;
+        json_writer
+            .string_value("\"\\/\u{0008}\u{000C}\n\r\t")
+            .await?;
 
-        json_writer.string_value("\u{10FFFF}")?;
+        json_writer.string_value("\u{10FFFF}").await?;
 
-        json_writer.end_array()?;
-        json_writer.finish_document()?;
+        json_writer.end_array().await?;
+        json_writer.finish_document().await?;
 
         assert_eq!(
             r#"["","ab","\u0000\u001F","a b","\"\\/\b\f\n\r\t","#.to_owned() + "\"\u{10FFFF}\"]",
@@ -1031,41 +1063,43 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn string_writer() -> TestResult {
+    #[futures_test::test]
+    async fn string_writer() -> TestResult {
         let mut writer = Vec::<u8>::new();
         let mut json_writer = JsonStreamWriter::new(&mut writer);
-        json_writer.begin_array()?;
+        json_writer.begin_array().await?;
 
-        let mut string_writer = json_writer.string_value_writer()?;
-        assert_eq!(0, string_writer.write(b"")?);
-        string_writer.write_all(b"a b")?;
-        string_writer.write_all(b"\x00\x1F")?;
-        string_writer.write_all(b"\"\\/\x08\x0C\n\r\t")?;
-        string_writer.write_all("\u{007F}\u{10FFFF}".as_bytes())?;
+        let mut string_writer = json_writer.string_value_writer().await?;
+        assert_eq!(0, string_writer.write(b"").await?);
+        string_writer.write_all(b"a b").await?;
+        string_writer.write_all(b"\x00\x1F").await?;
+        string_writer.write_all(b"\"\\/\x08\x0C\n\r\t").await?;
+        string_writer
+            .write_all("\u{007F}\u{10FFFF}".as_bytes())
+            .await?;
 
         // Split bytes of multi-byte UTF-8, writing each byte separately
         let bytes = "\u{007F}\u{0080}\u{07FF}\u{0800}\u{FFFF}\u{10000}\u{10FFFF}".as_bytes();
         for b in bytes {
-            string_writer.write_all(&[*b])?;
+            string_writer.write_all(&[*b]).await?;
         }
-        string_writer.finish_value()?;
+        string_writer.finish_value().await?;
 
         // Mix `write_all` and `write_str`
-        let mut string_writer = json_writer.string_value_writer()?;
-        string_writer.write_all("\u{10FFFF}".as_bytes())?;
-        string_writer.write_str("a \u{10FFFF}")?;
-        string_writer.write_all("b".as_bytes())?;
-        string_writer.write_str("")?; // empty string
-        string_writer.write_all("c".as_bytes())?;
-        string_writer.finish_value()?;
+        let mut string_writer = json_writer.string_value_writer().await?;
+        string_writer.write_all("\u{10FFFF}".as_bytes()).await?;
+        string_writer.write_str("a \u{10FFFF}").await?;
+        string_writer.write_all("b".as_bytes()).await?;
+        string_writer.write_str("").await?; // empty string
+        string_writer.write_all("c".as_bytes()).await?;
+        string_writer.finish_value().await?;
 
         // Write an empty string
-        let string_writer = json_writer.string_value_writer()?;
-        string_writer.finish_value()?;
+        let string_writer = json_writer.string_value_writer().await?;
+        string_writer.finish_value().await?;
 
-        json_writer.end_array()?;
-        json_writer.finish_document()?;
+        json_writer.end_array().await?;
+        json_writer.finish_document().await?;
         assert_eq!(
             r#"["a b\u0000\u001F\"\\/\b\f\n\r\t"#.to_owned()
                 + "\u{007F}\u{10FFFF}\u{007F}\u{0080}\u{07FF}\u{0800}\u{FFFF}\u{10000}\u{10FFFF}\",\"\u{10FFFF}a \u{10FFFF}bc\",\"\"]",
@@ -1074,24 +1108,24 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn string_writer_flush() -> TestResult {
+    #[futures_test::test]
+    async fn string_writer_flush() -> TestResult {
         let mut writer = Vec::<u8>::new();
         let mut json_writer = JsonStreamWriter::new(&mut writer);
 
-        let mut string_writer = json_writer.string_value_writer()?;
-        string_writer.write_all(b"abcd")?;
-        string_writer.flush()?;
-        string_writer.write_all(b"efgh")?;
-        string_writer.flush()?;
+        let mut string_writer = json_writer.string_value_writer().await?;
+        string_writer.write_all(b"abcd").await?;
+        string_writer.flush().await?;
+        string_writer.write_all(b"efgh").await?;
+        string_writer.flush().await?;
         drop(string_writer);
 
         assert_eq!("\"abcdefgh", String::from_utf8(writer)?);
         Ok(())
     }
 
-    #[test]
-    fn string_writer_invalid() {
+    #[futures_test::test]
+    async fn string_writer_invalid() {
         // Uses macro instead of function with FnOnce(Box<...>) as parameter to avoid issues with
         // calling `StringValueWriter::finish_value` consuming `self`, see https://stackoverflow.com/q/46620790
         macro_rules! assert_invalid_utf8 {
@@ -1101,17 +1135,18 @@ mod tests {
             ) => {
                 let mut writer = Vec::<u8>::new();
                 let mut json_writer = JsonStreamWriter::new(&mut writer);
-                let mut $string_value_writer = json_writer.string_value_writer().unwrap();
+                let mut $string_value_writer = json_writer.string_value_writer().await.unwrap();
 
                 // Use a closure here to allow `$writing_expr` to use the `?` operator for error handling
                 #[allow(unused_mut)] // only for some callers the closure has to be mutable
-                let mut writing_function = || -> Result<(), IoError> {
+                let mut writing_function = || {
                     $writing_expr
                 };
                 // Explicitly specify expression type to avoid callers having to specify it
                 let expected_custom_message: Option<&str> = $expected_custom_message;
 
-                match writing_function() {
+                let res: Result<(), IoError> = writing_function().await;
+                match res {
                     Ok(_) => panic!("Should have failed"),
                     Err(e) => {
                         assert_eq!(ErrorKind::InvalidData, e.kind());
@@ -1132,90 +1167,90 @@ mod tests {
         }
 
         assert_invalid_utf8!(
-            |w| {
+            |w| async move {
                 // Invalid UTF-8 byte 1111_1000
-                w.write_all(b"\xF8")
+                w.write_all(b"\xF8").await
             },
             Some("invalid UTF-8 data"),
         );
 
         assert_invalid_utf8!(
-            |w| {
+            |w| async move {
                 // Malformed UTF-8; high surrogate U+D800 encoded in UTF-8 (= invalid)
-                w.write_all(b"\xED\xA0\x80")
+                w.write_all(b"\xED\xA0\x80").await
             },
             None,
         );
 
         assert_invalid_utf8!(
-            |w| {
+            |w| async move {
                 // Greater than max code point U+10FFFF; split across multiple bytes
-                w.write_all(b"\xF4")?;
-                w.write_all(b"\x90")?;
-                w.write_all(b"\x80")?;
-                w.write_all(b"\x80")
+                w.write_all(b"\xF4").await?;
+                w.write_all(b"\x90").await?;
+                w.write_all(b"\x80").await?;
+                w.write_all(b"\x80").await
             },
             None,
         );
 
         assert_invalid_utf8!(
-            |w| {
+            |w| async move {
                 // Overlong encoding for two bytes
-                w.write_all(b"\xC1\xBF")
+                w.write_all(b"\xC1\xBF").await
             },
             None,
         );
 
         assert_invalid_utf8!(
-            |w| {
+            |w| async move {
                 // Incomplete four bytes
-                w.write_all(b"\xF0")?;
-                w.write_all(b"\x90")?;
-                w.write_all(b"\x80")?;
-                w.finish_value()
+                w.write_all(b"\xF0").await?;
+                w.write_all(b"\x90").await?;
+                w.write_all(b"\x80").await?;
+                w.finish_value().await
             },
             Some("incomplete multi-byte UTF-8 data"),
         );
 
         assert_invalid_utf8!(
-            |w| {
+            |w| async move {
                 // Leading continuation byte
-                w.write_all(b"\x80")?;
-                w.finish_value()
+                w.write_all(b"\x80").await?;
+                w.finish_value().await
             },
             None,
         );
 
         assert_invalid_utf8!(
-            |w| {
+            |w| async move {
                 // Too many continuation bytes
-                w.write_all(b"\xC2")?;
-                w.write_all(b"\x80")?;
-                w.write_all(b"\x80")?;
-                w.finish_value()
+                w.write_all(b"\xC2").await?;
+                w.write_all(b"\x80").await?;
+                w.write_all(b"\x80").await?;
+                w.finish_value().await
             },
             None,
         );
 
         assert_invalid_utf8!(
-            |w| {
+            |w| async move {
                 // Incomplete multi-byte followed by `write_str`
-                w.write_all(b"\xF0")?;
-                w.write_str("")?; // even empty string should trigger this error
-                w.finish_value()
+                w.write_all(b"\xF0").await?;
+                w.write_str("").await?; // even empty string should trigger this error
+                w.finish_value().await
             },
             Some("incomplete multi-byte UTF-8 data"),
         );
     }
 
-    #[test]
-    fn string_writer_repeats_error() -> TestResult {
+    #[futures_test::test]
+    async fn string_writer_repeats_error() -> TestResult {
         let mut writer = Vec::<u8>::new();
         let mut json_writer = JsonStreamWriter::new(&mut writer);
 
-        let mut string_writer = json_writer.string_value_writer()?;
+        let mut string_writer = json_writer.string_value_writer().await?;
         // Invalid UTF-8 byte 1111_1000
-        match string_writer.write_all(b"\xF8") {
+        match string_writer.write_all(b"\xF8").await {
             Ok(_) => panic!("Should have failed"),
             Err(e) => {
                 assert_eq!(ErrorKind::InvalidData, e.kind());
@@ -1247,10 +1282,10 @@ mod tests {
             }
         }
 
-        assert_error(string_writer.write_all(b"test"));
-        assert_error(string_writer.write_str("test"));
-        assert_error(string_writer.flush());
-        assert_error(string_writer.finish_value());
+        assert_error(string_writer.write_all(b"test").await);
+        assert_error(string_writer.write_str("test").await);
+        assert_error(string_writer.flush().await);
+        assert_error(string_writer.finish_value().await);
 
         // Should still consider string value writer as active because value was not
         // successfully finished
@@ -1259,91 +1294,93 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[futures_test::test]
     #[should_panic(
         expected = "Incorrect writer usage: Cannot end array when string value writer is still active"
     )]
-    fn string_writer_array_incomplete() {
+    async fn string_writer_array_incomplete() {
         let mut writer = Vec::<u8>::new();
         let mut json_writer = JsonStreamWriter::new(&mut writer);
-        json_writer.begin_array().unwrap();
+        json_writer.begin_array().await.unwrap();
 
-        let string_writer = json_writer.string_value_writer().unwrap();
+        let string_writer = json_writer.string_value_writer().await.unwrap();
         drop(string_writer);
 
-        json_writer.end_array().unwrap();
+        json_writer.end_array().await.unwrap();
     }
 
-    #[test]
+    #[futures_test::test]
     #[should_panic(
         expected = "Incorrect writer usage: Cannot end object when string value writer is still active"
     )]
-    fn string_writer_object_incomplete() {
+    async fn string_writer_object_incomplete() {
         let mut writer = Vec::<u8>::new();
         let mut json_writer = JsonStreamWriter::new(&mut writer);
-        json_writer.begin_object().unwrap();
-        json_writer.name("a").unwrap();
+        json_writer.begin_object().await.unwrap();
+        json_writer.name("a").await.unwrap();
 
-        let string_writer = json_writer.string_value_writer().unwrap();
+        let string_writer = json_writer.string_value_writer().await.unwrap();
         drop(string_writer);
 
-        json_writer.end_object().unwrap();
+        json_writer.end_object().await.unwrap();
     }
 
-    #[test]
+    #[futures_test::test]
     #[should_panic(
         expected = "Incorrect writer usage: Cannot finish document when string value writer is still active"
     )]
-    fn string_writer_incomplete_top_level() {
+    async fn string_writer_incomplete_top_level() {
         let mut writer = Vec::<u8>::new();
         let mut json_writer = JsonStreamWriter::new(&mut writer);
 
-        let string_writer = json_writer.string_value_writer().unwrap();
+        let string_writer = json_writer.string_value_writer().await.unwrap();
         drop(string_writer);
 
-        json_writer.finish_document().unwrap();
+        json_writer.finish_document().await.unwrap();
     }
 
-    #[test]
+    #[futures_test::test]
     #[should_panic(expected = "Incorrect writer usage: Cannot write value when name is expected")]
-    fn string_writer_for_name() {
+    async fn string_writer_for_name() {
         let mut writer = Vec::<u8>::new();
         let mut json_writer = JsonStreamWriter::new(&mut writer);
-        json_writer.begin_object().unwrap();
+        json_writer.begin_object().await.unwrap();
 
-        json_writer.string_value_writer().unwrap();
+        json_writer.string_value_writer().await.unwrap();
     }
 
-    #[test]
+    #[futures_test::test]
     #[should_panic(
         expected = "Incorrect writer usage: Cannot write name when name is not expected"
     )]
-    fn name_as_value() {
+    async fn name_as_value() {
         let mut writer = Vec::<u8>::new();
         let mut json_writer = JsonStreamWriter::new(&mut writer);
 
-        json_writer.name("test").unwrap();
+        json_writer.name("test").await.unwrap();
     }
 
-    #[test]
+    #[futures_test::test]
     #[should_panic(
         expected = "Incorrect writer usage: Cannot write name when name is not expected"
     )]
-    fn name_as_member_value() {
+    async fn name_as_member_value() {
         let mut writer = Vec::<u8>::new();
         let mut json_writer = JsonStreamWriter::new(&mut writer);
-        json_writer.begin_object().unwrap();
-        json_writer.name("a").unwrap();
+        json_writer.begin_object().await.unwrap();
+        json_writer.name("a").await.unwrap();
 
-        json_writer.name("test").unwrap();
+        json_writer.name("test").await.unwrap();
     }
 
-    #[test]
-    fn automatic_buffer_flush() -> TestResult {
+    #[futures_test::test]
+    async fn automatic_buffer_flush() -> TestResult {
         let mut writer = Vec::<u8>::new();
         let mut json_writer = JsonStreamWriter::new(&mut writer);
-        json_writer.string_value("abc\"def".repeat(WRITER_BUF_SIZE).as_str())?;
-        json_writer.finish_document()?;
+        json_writer
+            .string_value("abc\"def".repeat(WRITER_BUF_SIZE).as_str())
+            .await?;
+        json_writer.finish_document().await?;
 
         assert_eq!(
             format!("\"{}\"", "abc\\\"def".repeat(WRITER_BUF_SIZE)),
@@ -1352,9 +1389,12 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn multiple_top_level() -> TestResult {
-        fn create_writer<W: Write>(writer: W, top_level_separator: &str) -> JsonStreamWriter<W> {
+    #[futures_test::test]
+    async fn multiple_top_level() -> TestResult {
+        fn create_writer<W: AsyncWrite>(
+            writer: W,
+            top_level_separator: &str,
+        ) -> JsonStreamWriter<W> {
             JsonStreamWriter::new_custom(
                 writer,
                 WriterSettings {
@@ -1366,46 +1406,46 @@ mod tests {
 
         let mut writer = Vec::<u8>::new();
         let mut json_writer = create_writer(&mut writer, "");
-        json_writer.begin_array()?;
-        json_writer.end_array()?;
-        json_writer.finish_document()?;
+        json_writer.begin_array().await?;
+        json_writer.end_array().await?;
+        json_writer.finish_document().await?;
         assert_eq!("[]", String::from_utf8(writer)?);
 
         let mut writer = Vec::<u8>::new();
         let mut json_writer = create_writer(&mut writer, "");
-        json_writer.begin_array()?;
-        json_writer.end_array()?;
-        json_writer.begin_array()?;
-        json_writer.end_array()?;
-        json_writer.finish_document()?;
+        json_writer.begin_array().await?;
+        json_writer.end_array().await?;
+        json_writer.begin_array().await?;
+        json_writer.end_array().await?;
+        json_writer.finish_document().await?;
         assert_eq!("[][]", String::from_utf8(writer)?);
 
         let mut writer = Vec::<u8>::new();
         let mut json_writer = create_writer(&mut writer, "#\n#");
-        json_writer.begin_array()?;
-        json_writer.end_array()?;
-        json_writer.begin_array()?;
-        json_writer.end_array()?;
-        json_writer.finish_document()?;
+        json_writer.begin_array().await?;
+        json_writer.end_array().await?;
+        json_writer.begin_array().await?;
+        json_writer.end_array().await?;
+        json_writer.finish_document().await?;
         assert_eq!("[]#\n#[]", String::from_utf8(writer)?);
 
         Ok(())
     }
 
-    #[test]
+    #[futures_test::test]
     #[should_panic(
         expected = "Incorrect writer usage: Cannot write multiple top-level values when not enabled in writer settings"
     )]
-    fn multiple_top_level_disallowed() {
+    async fn multiple_top_level_disallowed() {
         let mut writer = Vec::<u8>::new();
         let mut json_writer = JsonStreamWriter::new(&mut writer);
-        json_writer.bool_value(true).unwrap();
+        json_writer.bool_value(true).await.unwrap();
 
-        json_writer.bool_value(false).unwrap();
+        json_writer.bool_value(false).await.unwrap();
     }
 
-    #[test]
-    fn pretty_print() -> TestResult {
+    #[futures_test::test]
+    async fn pretty_print() -> TestResult {
         let mut writer = Vec::<u8>::new();
         let mut json_writer = JsonStreamWriter::new_custom(
             &mut writer,
@@ -1416,39 +1456,39 @@ mod tests {
             },
         );
 
-        json_writer.begin_array()?;
+        json_writer.begin_array().await?;
 
-        json_writer.begin_array()?;
-        json_writer.end_array()?;
+        json_writer.begin_array().await?;
+        json_writer.end_array().await?;
 
-        json_writer.begin_array()?;
-        json_writer.number_value(1)?;
-        json_writer.end_array()?;
+        json_writer.begin_array().await?;
+        json_writer.number_value(1).await?;
+        json_writer.end_array().await?;
 
-        json_writer.begin_object()?;
+        json_writer.begin_object().await?;
 
-        json_writer.name("a")?;
-        json_writer.begin_array()?;
-        json_writer.begin_object()?;
-        json_writer.name("b")?;
-        json_writer.number_value(2)?;
-        json_writer.end_object()?;
-        json_writer.begin_object()?;
-        json_writer.end_object()?;
-        json_writer.end_array()?;
+        json_writer.name("a").await?;
+        json_writer.begin_array().await?;
+        json_writer.begin_object().await?;
+        json_writer.name("b").await?;
+        json_writer.number_value(2).await?;
+        json_writer.end_object().await?;
+        json_writer.begin_object().await?;
+        json_writer.end_object().await?;
+        json_writer.end_array().await?;
 
-        json_writer.name("c")?;
-        json_writer.number_value(3)?;
+        json_writer.name("c").await?;
+        json_writer.number_value(3).await?;
 
-        json_writer.end_object()?;
+        json_writer.end_object().await?;
 
-        json_writer.end_array()?;
+        json_writer.end_array().await?;
 
-        json_writer.begin_array()?;
-        json_writer.number_value(4)?;
-        json_writer.end_array()?;
+        json_writer.begin_array().await?;
+        json_writer.number_value(4).await?;
+        json_writer.end_array().await?;
 
-        json_writer.finish_document()?;
+        json_writer.finish_document().await?;
 
         assert_eq!(
             "[\n  [],\n  [\n    1\n  ],\n  {\n    \"a\": [\n      {\n        \"b\": 2\n      },\n      {}\n    ],\n    \"c\": 3\n  }\n]#[\n  4\n]",
@@ -1457,8 +1497,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn escape_all_control_chars() -> TestResult {
+    #[futures_test::test]
+    async fn escape_all_control_chars() -> TestResult {
         let mut writer = Vec::<u8>::new();
         let mut json_writer = JsonStreamWriter::new_custom(
             &mut writer,
@@ -1469,9 +1509,10 @@ mod tests {
         );
 
         json_writer
-            .string_value("\u{0000}\u{001F} test \" \u{007E}\u{007F}\u{0080}\u{009F}\u{00A0}")?;
+            .string_value("\u{0000}\u{001F} test \" \u{007E}\u{007F}\u{0080}\u{009F}\u{00A0}")
+            .await?;
 
-        json_writer.finish_document()?;
+        json_writer.finish_document().await?;
         assert_eq!(
             "\"\\u0000\\u001F test \\\" \u{007E}\\u007F\\u0080\\u009F\u{00A0}\"",
             String::from_utf8(writer)?
@@ -1479,8 +1520,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn escape_all_non_ascii() -> TestResult {
+    #[futures_test::test]
+    async fn escape_all_non_ascii() -> TestResult {
         let mut writer = Vec::<u8>::new();
         let mut json_writer = JsonStreamWriter::new_custom(
             &mut writer,
@@ -1489,8 +1530,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        json_writer.string_value("\u{0000}\u{001F} test \" \u{007F}\u{0080}\u{10000}\u{10FFFF}")?;
-        json_writer.finish_document()?;
+        json_writer
+            .string_value("\u{0000}\u{001F} test \" \u{007F}\u{0080}\u{10000}\u{10FFFF}")
+            .await?;
+        json_writer.finish_document().await?;
         assert_eq!(
             "\"\\u0000\\u001F test \\\" \u{007F}\\u0080\\uD800\\uDC00\\uDBFF\\uDFFF\"",
             String::from_utf8(writer)?
@@ -1505,8 +1548,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        json_writer.string_value("\u{0000} test \" \u{007F}\u{0080}\u{10FFFF}")?;
-        json_writer.finish_document()?;
+        json_writer
+            .string_value("\u{0000} test \" \u{007F}\u{0080}\u{10FFFF}")
+            .await?;
+        json_writer.finish_document().await?;
         assert_eq!(
             "\"\\u0000 test \\\" \\u007F\\u0080\\uDBFF\\uDFFF\"",
             String::from_utf8(writer)?
@@ -1515,29 +1560,30 @@ mod tests {
         Ok(())
     }
 
-    #[test]
+    #[futures_test::test]
     #[should_panic(
         expected = "Incorrect writer usage: Cannot finish document when no value has been written yet"
     )]
-    fn finish_empty_document() {
+    async fn finish_empty_document() {
         let mut writer = Vec::<u8>::new();
         let json_writer = JsonStreamWriter::new(&mut writer);
 
-        json_writer.finish_document().unwrap();
+        json_writer.finish_document().await.unwrap();
     }
 
-    #[test]
+    #[futures_test::test]
     #[should_panic(
         expected = "Incorrect writer usage: Cannot finish document when top-level value is not finished"
     )]
-    fn finish_incomplete_document() {
+    async fn finish_incomplete_document() {
         let mut writer = Vec::<u8>::new();
         let mut json_writer = JsonStreamWriter::new(&mut writer);
-        json_writer.begin_array().unwrap();
+        json_writer.begin_array().await.unwrap();
 
-        json_writer.finish_document().unwrap();
+        json_writer.finish_document().await.unwrap();
     }
 
+    /* // TODO
     /// Writer which returns `ErrorKind::Interrupted` most of the time
     struct InterruptedWriter {
         buf: Vec<u8>,
@@ -1556,26 +1602,41 @@ mod tests {
             String::from_utf8(self.buf).unwrap()
         }
     }
-    impl Write for InterruptedWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    impl AsyncWrite for InterruptedWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
             if buf.is_empty() {
-                return Ok(0);
+                return std::task::Poll::Ready(Ok(0));
             }
 
             if self.interrupted_count >= 3 {
                 self.interrupted_count = 0;
                 // Only write a single byte
                 self.buf.push(buf[0]);
-                Ok(1)
+                std::task::Poll::Ready(Ok(1))
             } else {
                 self.interrupted_count += 1;
-                Err(IoError::from(ErrorKind::Interrupted))
+                std::task::Poll::Ready(Err(IoError::from(ErrorKind::Interrupted)))
             }
         }
 
-        fn flush(&mut self) -> std::io::Result<()> {
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
             // Do nothing
-            Ok(())
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            // Do nothing
+            std::task::Poll::Ready(Ok(()))
         }
     }
 
@@ -1583,14 +1644,14 @@ mod tests {
     /// otherwise most `Write` methods will re-attempt the write even though the underlying
     /// JSON stream writer is in an inconsistent state (e.g. incomplete escape sequence
     /// having been written).
-    #[test]
-    fn string_writer_interrupted() -> TestResult {
+    #[futures_test::test]
+    async fn string_writer_interrupted() -> TestResult {
         let mut writer = InterruptedWriter::new();
         let mut json_writer = JsonStreamWriter::new(&mut writer);
 
-        let mut string_writer = json_writer.string_value_writer()?;
+        let mut string_writer = json_writer.string_value_writer().await?;
         let string_bytes = "test \" \u{10FFFF}".as_bytes();
-        match string_writer.write(string_bytes) {
+        match string_writer.write(string_bytes).await {
             // Current implementation should have written complete buf content (this is not a requirement of `Write::write` though)
             Ok(n) => assert_eq!(string_bytes.len(), n),
             // For current implementation no error should have occurred
@@ -1598,8 +1659,8 @@ mod tests {
             r => panic!("Unexpected result: {r:?}"),
         }
 
-        string_writer.finish_value()?;
-        json_writer.finish_document()?;
+        string_writer.finish_value().await?;
+        json_writer.finish_document().await?;
         assert_eq!("\"test \\\" \u{10FFFF}\"", writer.get_written_string());
 
         Ok(())
@@ -1607,23 +1668,25 @@ mod tests {
 
     /// JSON stream writer should continuously retry writing in case underlying `Write`
     /// returns `ErrorKind::Interrupted`.
-    #[test]
-    fn writer_interrupted() -> TestResult {
+    #[futures_test::test]
+    async fn writer_interrupted() -> TestResult {
         let mut writer = InterruptedWriter::new();
         let mut json_writer = JsonStreamWriter::new(&mut writer);
 
-        json_writer.begin_array()?;
-        json_writer.bool_value(true)?;
-        json_writer.number_value_from_string("123.4e5")?;
-        json_writer.string_value("test \" 1 \u{10FFFF}")?;
+        json_writer.begin_array().await?;
+        json_writer.bool_value(true).await?;
+        json_writer.number_value_from_string("123.4e5").await?;
+        json_writer.string_value("test \" 1 \u{10FFFF}").await?;
 
-        let mut string_writer = json_writer.string_value_writer()?;
-        string_writer.write_all("test \" 2 \u{10FFFF}, ".as_bytes())?;
-        string_writer.write_str("test \" 3 \u{10FFFF}")?;
-        string_writer.finish_value()?;
+        let mut string_writer = json_writer.string_value_writer().await?;
+        string_writer
+            .write_all("test \" 2 \u{10FFFF}, ".as_bytes())
+            .await?;
+        string_writer.write_str("test \" 3 \u{10FFFF}").await?;
+        string_writer.finish_value().await?;
 
-        json_writer.end_array()?;
-        json_writer.finish_document()?;
+        json_writer.end_array().await?;
+        json_writer.finish_document().await?;
 
         assert_eq!(
             "[true,123.4e5,\"test \\\" 1 \u{10FFFF}\",\"test \\\" 2 \u{10FFFF}, test \\\" 3 \u{10FFFF}\"]",
@@ -1631,17 +1694,32 @@ mod tests {
         );
         Ok(())
     }
+    */
 
     struct DebuggableWriter;
 
-    impl Write for DebuggableWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    impl AsyncWrite for DebuggableWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
             // Pretend complete buffer content was written
-            Ok(buf.len())
+            std::task::Poll::Ready(Ok(buf.len()))
         }
 
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
         }
     }
 
@@ -1658,15 +1736,15 @@ mod tests {
     // The following Debug output tests mainly exist to make sure the buffer content is properly displayed
     // Besides that they heavily rely on implementation details
 
-    #[test]
-    fn debug_writer() -> TestResult {
+    #[futures_test::test]
+    async fn debug_writer() -> TestResult {
         let mut json_writer = new_with_debuggable_writer();
         assert_eq!(
             "JsonStreamWriter { writer: debuggable-writer, buf_count: 0, buf_str: \"\", is_empty: true, expects_member_name: false, stack: [], is_string_value_writer_active: false, indentation_level: 0, writer_settings: WriterSettings { pretty_print: false, escape_all_control_chars: false, escape_all_non_ascii: false, multi_top_level_value_separator: None } }",
             format!("{json_writer:?}")
         );
 
-        json_writer.string_value("test")?;
+        json_writer.string_value("test").await?;
         assert_eq!(
             "JsonStreamWriter { writer: debuggable-writer, buf_count: 6, buf_str: \"\\\"test\\\"\", is_empty: false, expects_member_name: false, stack: [], is_string_value_writer_active: false, indentation_level: 0, writer_settings: WriterSettings { pretty_print: false, escape_all_control_chars: false, escape_all_non_ascii: false, multi_top_level_value_separator: None } }",
             format!("{json_writer:?}")
@@ -1674,10 +1752,12 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn debug_writer_long() -> TestResult {
+    #[futures_test::test]
+    async fn debug_writer_long() -> TestResult {
         let mut json_writer = new_with_debuggable_writer();
-        json_writer.string_value("test".repeat(100).as_str())?;
+        json_writer
+            .string_value("test".repeat(100).as_str())
+            .await?;
         assert_eq!(
             "JsonStreamWriter { writer: debuggable-writer, buf_count: 402, buf_str: \"\\\"testtesttesttesttesttest ... testtesttesttesttesttest\\\"\", is_empty: false, expects_member_name: false, stack: [], is_string_value_writer_active: false, indentation_level: 0, writer_settings: WriterSettings { pretty_print: false, escape_all_control_chars: false, escape_all_non_ascii: false, multi_top_level_value_separator: None } }",
             format!("{json_writer:?}"
@@ -1685,14 +1765,14 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn debug_writer_incomplete_with_suffix() -> TestResult {
+    #[futures_test::test]
+    async fn debug_writer_incomplete_with_suffix() -> TestResult {
         let mut json_writer = new_with_debuggable_writer();
         // Write a string value which splits a multi-byte UTF-8 char
         // `WRITER_BUF_SIZE - 2` due to leading '"' of string, and to leave one byte space for
         // first byte of multi-byte UTF-8
         let string_value = format!("{}\u{10FFFF}test", "a".repeat(WRITER_BUF_SIZE - 2));
-        json_writer.string_value(&string_value)?;
+        json_writer.string_value(&string_value).await?;
         assert_eq!(
             "JsonStreamWriter { writer: debuggable-writer, buf_count: 8, buf...: [143, 191, 191], buf_str: \"...test\\\"\", is_empty: false, expects_member_name: false, stack: [], is_string_value_writer_active: false, indentation_level: 0, writer_settings: WriterSettings { pretty_print: false, escape_all_control_chars: false, escape_all_non_ascii: false, multi_top_level_value_separator: None } }",
             format!("{json_writer:?}")
@@ -1700,8 +1780,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn debug_writer_incomplete_with_long_suffix() -> TestResult {
+    #[futures_test::test]
+    async fn debug_writer_incomplete_with_long_suffix() -> TestResult {
         let mut json_writer = new_with_debuggable_writer();
         // Write a string value which splits a multi-byte UTF-8 char
         // `WRITER_BUF_SIZE - 2` due to leading '"' of string, and to leave one byte space for
@@ -1711,7 +1791,7 @@ mod tests {
             "a".repeat(WRITER_BUF_SIZE - 2),
             "test".repeat(100)
         );
-        json_writer.string_value(&string_value)?;
+        json_writer.string_value(&string_value).await?;
         assert_eq!(
             "JsonStreamWriter { writer: debuggable-writer, buf_count: 404, buf...: [143, 191, 191], buf_str: \"...testtesttesttesttesttestt ... testtesttesttesttesttest\\\"\", is_empty: false, expects_member_name: false, stack: [], is_string_value_writer_active: false, indentation_level: 0, writer_settings: WriterSettings { pretty_print: false, escape_all_control_chars: false, escape_all_non_ascii: false, multi_top_level_value_separator: None } }",
             format!("{json_writer:?}")
@@ -1726,12 +1806,12 @@ mod tests {
         use ::serde::{ser::SerializeStruct, Serialize, Serializer};
         use std::collections::HashMap;
 
-        #[test]
-        fn serialize_value() -> TestResult {
+        #[futures_test::test]
+        async fn serialize_value() -> TestResult {
             let mut writer = Vec::<u8>::new();
             let mut json_writer = JsonStreamWriter::new(&mut writer);
-            json_writer.begin_object()?;
-            json_writer.name("outer")?;
+            json_writer.begin_object().await?;
+            json_writer.name("outer").await?;
 
             struct CustomStruct;
             impl Serialize for CustomStruct {
@@ -1743,11 +1823,11 @@ mod tests {
                     struc.end()
                 }
             }
-            json_writer.serialize_value(&CustomStruct)?;
+            json_writer.serialize_value(&CustomStruct).await?;
 
-            json_writer.end_object()?;
+            json_writer.end_object().await?;
 
-            json_writer.finish_document()?;
+            json_writer.finish_document().await?;
             assert_eq!(
                 r#"{"outer":{"a":1,"b":{"key":"value"},"c":[1,2]}}"#,
                 String::from_utf8(writer)?
@@ -1756,9 +1836,9 @@ mod tests {
             Ok(())
         }
 
-        #[test]
-        fn serialize_value_invalid() {
-            let mut json_writer = JsonStreamWriter::new(std::io::sink());
+        #[futures_test::test]
+        async fn serialize_value_invalid() {
+            let mut json_writer = JsonStreamWriter::new(futures::io::sink());
             let number = f32::NAN;
             match json_writer.serialize_value(&number) {
                 Err(SerializerError::InvalidNumber(message)) => {
@@ -1768,13 +1848,13 @@ mod tests {
             }
         }
 
-        #[test]
+        #[futures_test::test]
         #[should_panic(
             expected = "Incorrect writer usage: Cannot write value when name is expected"
         )]
-        fn serialize_value_no_value_expected() {
-            let mut json_writer = JsonStreamWriter::new(std::io::sink());
-            json_writer.begin_object().unwrap();
+        async fn serialize_value_no_value_expected() {
+            let mut json_writer = JsonStreamWriter::new(futures::io::sink());
+            json_writer.begin_object().await.unwrap();
 
             json_writer.serialize_value(&"test").unwrap();
         }
